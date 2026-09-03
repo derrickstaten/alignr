@@ -1,0 +1,27 @@
+Package: alignr
+Title: Align Figure Layout for RStudio and Positron
+Version: 2026.9.3
+Authors@R: c(
+    person("Derrick", "Staten", role = c("aut", "cre"), email = "statenderrick@gmail.com"),
+    person("Align", role = "cph"))
+Description: Opens the Align multi-page figure canvas in the RStudio/Positron
+    Viewer pane, rendering R visualizations through the live session — the
+    user's installed packages and in-memory data frames, no WASM, no upload.
+    See ALI-186. On macOS/arm64 install the compiled dependencies as binaries
+    (install.packages(c("svglite","httpuv","jsonlite","openssl","curl"), type = "binary")) —
+    source builds need a C++ toolchain plus freetype/harfbuzz.
+License: MIT + file LICENSE
+URL: https://github.com/derrickstaten/alignr, https://alignfigures.com
+BugReports: https://github.com/derrickstaten/alignr/issues
+Encoding: UTF-8
+Imports:
+    base64enc,
+    curl,
+    httpuv,
+    jsonlite,
+    openssl,
+    svglite
+Suggests:
+    keyring,
+    rstudioapi,
+    ggplot2
