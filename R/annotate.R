@@ -1,12 +1,17 @@
-# "Annotate for Align" — the zero-AI marker-insertion primitive (ALI-198 T2).
+# Marker insertion — the zero-AI primitive that turns a block of the user's
+# script into a tracked Align figure (ALI-198 T2, reshaped by DS-423).
 #
-# Two entry points share this file's logic, per the ticket's two-tier design:
-#  - align_addin_annotate(): RStudio Addins-menu binding, runs synchronously
-#    in the R console with no direct line to the browser session, so its
-#    result is queued (align_drain_pending_annotations) for the browser's
-#    poll to pick up.
-#  - POST /annotate (server.R): the chat-panel button's entry point, called
-#    directly from the browser and answered synchronously.
+# Three entry points share this file's logic:
+#  - POST /annotate with {startLine, endLine} (server.R): the primary path
+#    since DS-423. The plugin's "Add" list shows the figures
+#    align_scan_unmarked_plots found; clicking one sends its line range here.
+#    The user never selects code.
+#  - POST /annotate with no body: the fallback for code the detector missed —
+#    wraps whatever is selected in the editor.
+#  - align_addin_annotate(): the RStudio Addins-menu binding for that same
+#    selection path. It runs in the R console with no line to the browser,
+#    so its result is queued (align_drain_pending_annotations) for the
+#    browser's poll to pick up.
 #
 # Mechanical only: default labels come from counting existing markers, never
 # an LLM call (Round 4.B — "must work with zero AI calls" is a hard
@@ -49,86 +54,149 @@
   sprintf("# Figure: %s [fig:%s] ----", safe_label, marker_id)
 }
 
-#' Regex/substring scan for plotting-shaped code that isn't already inside a
-#' marked region (Round 4.C) — the proactive nudge's entire detection
-#' mechanism, deliberately zero LLM calls. False positives are fine (it's a
-#' nudge, not an auto-apply); false negatives just mean a missed nudge.
-align_scan_unmarked_plots <- function(content) {
-  lines <- strsplit(content, "\n", fixed = TRUE)[[1]]
-  if (length(lines) == 0) return(list())
+#' Code that reads as "this draws a figure". Deliberately broad and zero-LLM
+#' (Round 4.B): a false positive is a card nobody clicks, a false negative is
+#' a figure the user has to select by hand via the fallback link.
+.align_plot_hint_pattern <- "ggplot\\(|geom_|\\bplot\\(|\\bhist\\(|\\bbarplot\\(|\\bboxplot\\(|\\bpie\\(|\\bimage\\(|\\bheatmap\\(|\\bpheatmap\\(|\\bp\\s*<-|\\bp\\s*=[^=]"
 
+#' TRUE for every line that sits inside an existing marker region (a marker
+#' line through the line before the next marker, or EOF).
+.align_marked_line_mask <- function(lines) {
   marker_lines <- grep("^\\s*#\\s*Figure:.*\\[fig:[A-Za-z0-9_-]+\\]\\s*-{4,}\\s*$", lines)
-  in_marked_region <- logical(length(lines))
+  mask <- logical(length(lines))
   if (length(marker_lines) > 0) {
     for (i in seq_along(marker_lines)) {
       start <- marker_lines[i]
       end <- if (i < length(marker_lines)) marker_lines[i + 1] - 1 else length(lines)
-      in_marked_region[start:end] <- TRUE
+      mask[start:end] <- TRUE
     }
   }
+  mask
+}
 
-  hint_pattern <- "ggplot\\(|geom_|\\bp\\s*<-|\\bp\\s*=[^=]"
+#' Comment lines never contain runnable plotting code — prose like "select
+#' the `p <- ...` block" in a file header used to trigger the nudge (ALI-273
+#' live finding). A trailing comment is stripped too, so `x <- 1 # ggplot(`
+#' doesn't hit on the comment half. A `#` inside a string is mis-stripped,
+#' which only ever costs a missed hint.
+.align_strip_comments <- function(lines) sub("#.*$", "", lines)
+
+#' Finds the figures in a script that aren't already tracked — the whole
+#' detection mechanism behind the plugin's "Add" list (DS-423).
+#'
+#' Why parse rather than grep lines: a figure is a top-level R expression
+#' (`p <- ggplot(...) + geom_point() + theme(...)` spanning 20 lines), and
+#' the user shouldn't have to know where it starts and ends. `parse()` with
+#' srcrefs gives every top-level expression's exact line range for free, so
+#' each hit is a click-ready {startLine, endLine} rather than a hint about
+#' one line. Still zero LLM calls. When the file doesn't parse (mid-edit
+#' syntax error) the per-line scan takes over so the list never goes blank
+#' on a typo. `line` is kept on every hit for older bundles that read it.
+align_scan_unmarked_plots <- function(content) {
+  lines <- strsplit(content, "\n", fixed = TRUE)[[1]]
+  if (length(lines) == 0) return(list())
+  marked <- .align_marked_line_mask(lines)
+
+  exprs <- tryCatch(
+    suppressWarnings(parse(text = lines, keep.source = TRUE)),
+    error = function(e) NULL
+  )
+  if (is.null(exprs)) return(.align_scan_unmarked_plots_by_line(lines, marked))
+
+  refs <- attr(exprs, "srcref")
+  hits <- list()
+  for (ref in refs) {
+    start <- ref[[1L]]
+    end <- ref[[3L]]
+    if (any(marked[start:end])) next
+    code <- .align_strip_comments(lines[start:end])
+    if (!any(grepl(.align_plot_hint_pattern, code, perl = TRUE))) next
+    hits[[length(hits) + 1]] <- list(
+      line = start,
+      startLine = start,
+      endLine = end,
+      snippet = trimws(lines[start])
+    )
+  }
+  hits
+}
+
+#' Pre-DS-423 per-line scan, kept as the fallback for unparseable files.
+.align_scan_unmarked_plots_by_line <- function(lines, marked) {
   hits <- list()
   for (i in seq_along(lines)) {
-    if (in_marked_region[i]) next
-    # Comment lines never contain runnable plotting code — prose like
-    # "select the `p <- ...` block" in a file header used to trigger the
-    # nudge (ALI-273 live finding). Strip a trailing comment too, so
-    # `x <- 1  # then ggplot(...)` doesn't hit on the comment half.
-    code <- sub("#.*$", "", lines[i])
-    if (grepl(hint_pattern, code, perl = TRUE)) {
-      hits[[length(hits) + 1]] <- list(line = i, snippet = trimws(lines[i]))
+    if (marked[i]) next
+    if (grepl(.align_plot_hint_pattern, .align_strip_comments(lines[i]), perl = TRUE)) {
+      hits[[length(hits) + 1]] <- list(line = i, startLine = i, endLine = i, snippet = trimws(lines[i]))
     }
   }
   hits
 }
 
-#' Wraps the current RStudio editor selection in an Align figure marker —
-#' the shared "Annotate for Align" primitive. Errors travel as data
-#' (list(error=)), same contract as the rest of this package, since both
-#' call sites (addin dialog, HTTP response) need to show them without a
-#' thrown condition to catch.
-align_annotate_selection <- function() {
+#' The editor context both annotate entries need, or list(error=) when the
+#' active document can't be tracked. Errors travel as data, same contract as
+#' the rest of this package, since every call site (addin dialog, HTTP
+#' response) shows them without a thrown condition to catch.
+.align_annotate_context <- function() {
   if (!requireNamespace("rstudioapi", quietly = TRUE) || !rstudioapi::isAvailable()) {
     return(list(error = "RStudio API not available."))
   }
   ctx <- tryCatch(rstudioapi::getActiveDocumentContext(), error = function(e) NULL)
   if (is.null(ctx) || !nzchar(ctx$path)) {
-    return(list(error = "Save the active file before annotating — Align tracks files on disk, not unsaved buffers."))
+    return(list(error = "Save the file first — Align tracks files on disk, not unsaved editors."))
   }
-
   rel_path <- .align_rel_from_abs(ctx$path)
   if (is.null(rel_path)) {
-    return(list(error = "The active file is outside the R working directory."))
+    return(list(error = "This file is outside the R working directory. Set the working directory to its folder (Session > Set Working Directory) and try again."))
   }
+  list(ctx = ctx, relPath = rel_path)
+}
 
-  sel <- ctx$selection[[1]]
-  selected_text <- if (!is.null(sel)) sel$text else ""
-  if (!nzchar(trimws(selected_text))) {
-    return(list(error = "Select the code to annotate first."))
+#' Inserts a marker above `start_row` of the active document (or adopts the
+#' marker already sitting there) so the lines `start_row..end_row` become a
+#' tracked figure region. Shared by the range and selection entries.
+.align_annotate_rows <- function(ctx, rel_path, start_row, end_row) {
+  n <- length(ctx$contents)
+  if (start_row < 1 || end_row < start_row || start_row > n) {
+    return(list(error = "That code is no longer where it was — the file changed. Try again."))
+  }
+  end_row <- min(end_row, n)
+  region_text <- paste(ctx$contents[start_row:end_row], collapse = "\n")
+
+  # A block that already contains a tracked figure further down (the user
+  # selected the whole file, DS-423 live finding) would get a marker above
+  # it whose region ends at that inner marker — a "figure" made of the
+  # preamble, which renders nothing. Refuse and say which figure is inside.
+  inner_re <- "^\\s*#\\s*Figure:\\s*(.*?)\\s*\\[fig:[A-Za-z0-9_-]+\\]\\s*-{4,}\\s*$"
+  if (end_row > start_row) {
+    inner <- grep(inner_re, ctx$contents[(start_row + 1):end_row], value = TRUE)
+    if (length(inner) > 0) {
+      inner_label <- sub(inner_re, "\\1", inner[[1]])
+      return(list(error = sprintf(
+        "That selection already contains a tracked figure (%s). Select just the plot code.", inner_label)))
+    }
   }
 
   # Reuse an existing marker instead of stacking a second one (ALI-270
   # follow-up): a reload leaves markers in the file with no viz tracking
-  # them, and re-annotating the same block must adopt the existing id, not
-  # duplicate the line. Adopt when the selection's first line IS a marker
-  # line, or the nearest non-blank line above the selection is one.
+  # them, and re-adding the same block must adopt the existing id, not
+  # duplicate the line. Adopt when the first row IS a marker line, or the
+  # nearest non-blank line above it is one.
   marker_re <- "^\\s*#\\s*Figure:\\s*(.*?)\\s*\\[fig:([A-Za-z0-9_-]+)\\]\\s*-{4,}\\s*$"
-  sel_start_row <- sel$range$start[[1]]
   existing_line <- NULL
-  if (sel_start_row <= length(ctx$contents) && grepl(marker_re, ctx$contents[sel_start_row])) {
-    existing_line <- ctx$contents[sel_start_row]
+  if (grepl(marker_re, ctx$contents[start_row])) {
+    existing_line <- ctx$contents[start_row]
   } else {
-    i <- sel_start_row - 1
+    i <- start_row - 1
     while (i >= 1 && grepl("^\\s*$", ctx$contents[i])) i <- i - 1
     if (i >= 1 && grepl(marker_re, ctx$contents[i])) existing_line <- ctx$contents[i]
   }
   if (!is.null(existing_line)) {
-    # The selection may include the marker line itself — the region body a
+    # The rows may include the marker line itself — the region body a
     # later poll resolves never contains it, so strip it here too.
     body_lines <- Filter(
       function(l) !grepl(marker_re, l),
-      strsplit(selected_text, "\r\n|\r|\n")[[1]]
+      strsplit(region_text, "\r\n|\r|\n")[[1]]
     )
     return(list(
       filePath = rel_path,
@@ -144,10 +212,9 @@ align_annotate_selection <- function() {
   label <- .align_default_marker_label(full_content)
   marker_line <- .align_marker_line(label, marker_id)
 
-  # Insert directly above the selection's start line — the selection itself
-  # is left untouched, so its text (returned below) still matches what ends
-  # up as the region body once the poll re-scans the file.
-  start_row <- sel$range$start[[1]]
+  # Insert directly above the first row — the rows themselves are left
+  # untouched, so their text (returned below) still matches what ends up as
+  # the region body once the poll re-scans the file.
   insert_at <- rstudioapi::document_position(start_row, 1)
   rstudioapi::insertText(insert_at, paste0(marker_line, "\n"), id = ctx$id)
   # Deliberately no documentSave() here — Align never saves a file on the
@@ -156,12 +223,45 @@ align_annotate_selection <- function() {
   # currently active (align_active_document_state, tracked_files.R) rather
   # than requiring a save to become visible.
 
-  list(filePath = rel_path, markerId = marker_id, label = label, sourceCode = selected_text)
+  list(filePath = rel_path, markerId = marker_id, label = label, sourceCode = region_text)
+}
+
+#' DS-423 primary entry: track the figure occupying lines start..end of the
+#' active document — the range align_scan_unmarked_plots reported and the
+#' user clicked. No selection involved.
+align_annotate_range <- function(start_line, end_line) {
+  start_line <- suppressWarnings(as.integer(start_line))
+  end_line <- suppressWarnings(as.integer(end_line))
+  if (length(start_line) != 1 || length(end_line) != 1 || is.na(start_line) || is.na(end_line)) {
+    return(list(error = "A line range is required."))
+  }
+  a <- .align_annotate_context()
+  if (!is.null(a$error)) return(a)
+  .align_annotate_rows(a$ctx, a$relPath, start_line, end_line)
+}
+
+#' Fallback entry: wraps the current RStudio editor selection. Kept for code
+#' the detector doesn't recognise, and for the Addins-menu binding.
+align_annotate_selection <- function() {
+  a <- .align_annotate_context()
+  if (!is.null(a$error)) return(a)
+  ctx <- a$ctx
+  sel <- ctx$selection[[1]]
+  selected_text <- if (!is.null(sel)) sel$text else ""
+  if (!nzchar(trimws(selected_text))) {
+    return(list(error = "Select the figure's code in the editor first."))
+  }
+  start_row <- sel$range$start[[1]]
+  end_row <- sel$range$end[[1]]
+  # A selection ending at column 1 of the next line doesn't include that line.
+  if (end_row > start_row && sel$range$end[[2]] == 1) end_row <- end_row - 1
+  .align_annotate_rows(ctx, a$relPath, start_row, end_row)
 }
 
 #' Active RStudio document's tracking-relevant state (Round 4.A/4.C) — path,
 #' whether there's a selection ready to annotate, and unmarked-plot nudge
-#' hints. Powers the chat panel shell; zero LLM calls anywhere in it.
+#' figure hits (with line ranges since DS-423). Powers the plugin's "Your
+#' code" list; zero LLM calls anywhere in it.
 align_get_editor_context <- function() {
   if (!requireNamespace("rstudioapi", quietly = TRUE) || !rstudioapi::isAvailable()) {
     return(list(available = FALSE))

@@ -9,14 +9,15 @@ with one click.
 ## Install
 
 ```r
-# macOS: install the compiled dependencies as CRAN binaries first. R may
-# otherwise offer to build them from source, which needs Xcode's command-line
-# tools plus freetype/harfbuzz — Windows and Linux users can skip this line.
-install.packages(c("svglite", "httpuv", "jsonlite", "openssl", "curl", "base64enc"), type = "binary")
-
 install.packages("remotes")
 remotes::install_github("derrickstaten/alignr")
 ```
+
+Dependencies install automatically. If R asks *"Do you want to install from
+sources the packages which need compilation?"*, answer **no** — the prebuilt
+binaries are what you want, and building from source needs Xcode's
+command-line tools. To never be asked, run
+`options(install.packages.compile.from.source = "never")` first.
 
 Then, in RStudio or Positron:
 
@@ -49,6 +50,16 @@ align-web — build-on-demand, never committed there (ALI-269):
 ```bash
 npm run build --workspace=@align/rstudio-host
 ```
+
+Then load the package from source rather than installing it, so the release
+build in your R library stays as users have it (DS-423):
+
+```r
+pkgload::load_all("r-package")   # from the align-web repo root
+alignr::align_open()
+```
+
+Restarting R puts you back on the installed release. (`source("demo-plugin-code/r/01-setup-and-open-align.R")` does all of this plus demo data.)
 
 Guards that enforce the policy:
 

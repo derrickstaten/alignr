@@ -126,6 +126,12 @@
         return(.align_json(align_active_document_state()))
       }
       if (method == "POST" && path == "/annotate") {
+        # DS-423: a body with a line range tracks that range (the "Your
+        # code" list); no body falls back to the editor selection.
+        b <- tryCatch(.align_read_body(req), error = function(e) list())
+        if (!is.null(b$startLine) && !is.null(b$endLine)) {
+          return(.align_json(align_annotate_range(b$startLine, b$endLine)))
+        }
         return(.align_json(align_annotate_selection()))
       }
       if (method == "GET" && path == "/annotate/pending") {

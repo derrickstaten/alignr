@@ -3,7 +3,7 @@ Description: Open the Align figure canvas in the Viewer pane
 Binding: align_open
 Interactive: false
 
-Name: Annotate for Align
-Description: Wrap the current editor selection in an Align figure marker
+Name: Add selected code to Align
+Description: Track the selected code as an Align figure (the Add tab finds figures for you; this is for code it missed)
 Binding: align_addin_annotate
 Interactive: false

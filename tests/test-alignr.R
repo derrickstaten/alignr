@@ -244,11 +244,87 @@ unmarked_src <- paste(
 )
 hits <- align_scan_unmarked_plots(unmarked_src)
 check("unmarked plotting code is flagged", length(hits) == 1 && hits[[1]]$line == 2)
+check("a hit carries a click-ready line range (DS-423)",
+      identical(hits[[1]]$startLine, 2L) && identical(hits[[1]]$endLine, 2L))
 
-# No RStudio session in this headless harness — both entry points must
+# DS-423: a figure is a whole top-level expression, however many lines it
+# spans — the volcano shape from the Desktop test script.
+chain_src <- paste(
+  "library(ggplot2)",
+  "",
+  "df <- read.csv(\"volcano.csv\")",
+  "fc_cutoff <- 1",
+  "",
+  "p <- ggplot(df, aes(x = log2FC, y = negLogP)) +",
+  "  geom_point(alpha = 0.6) +",
+  "  geom_vline(xintercept = c(-fc_cutoff, fc_cutoff)) +",
+  "  theme(",
+  "    legend.position = \"bottom\"",
+  "  )",
+  "",
+  "p",
+  sep = "\n"
+)
+chain_hits <- align_scan_unmarked_plots(chain_src)
+check("a multi-line ggplot chain is ONE figure spanning its whole expression",
+      length(chain_hits) == 1 && chain_hits[[1]]$startLine == 6 && chain_hits[[1]]$endLine == 11)
+check("the hit's snippet is the expression's first line",
+      identical(chain_hits[[1]]$snippet, "p <- ggplot(df, aes(x = log2FC, y = negLogP)) +"))
+
+two_src <- paste(
+  "x <- 1:10",
+  "hist(x)",
+  "p <- ggplot2::ggplot(data.frame(x)) +",
+  "  ggplot2::geom_histogram()",
+  sep = "\n"
+)
+two_hits <- align_scan_unmarked_plots(two_src)
+check("base-R plots and ggplot chains are both found, as separate figures",
+      length(two_hits) == 2 && two_hits[[1]]$startLine == 2 && two_hits[[2]]$startLine == 3 && two_hits[[2]]$endLine == 4)
+
+marked_chain_src <- paste(
+  "# Figure: One [fig:aaa111] ----",
+  "p <- ggplot2::ggplot(df) +",
+  "  ggplot2::geom_point()",
+  sep = "\n"
+)
+check("an expression inside an existing marker region is not offered again",
+      length(align_scan_unmarked_plots(marked_chain_src)) == 0)
+
+comment_src <- "# select the `p <- ggplot(...)` block and click Add"
+check("prose in a comment is never a figure", length(align_scan_unmarked_plots(comment_src)) == 0)
+
+broken_src <- paste(
+  "p <- ggplot2::ggplot(df) +",
+  "  ggplot2::geom_point(",       # unbalanced — mid-edit typo
+  "x <- 1",
+  sep = "\n"
+)
+broken_hits <- align_scan_unmarked_plots(broken_src)
+check("an unparseable file falls back to per-line hits instead of going blank",
+      length(broken_hits) >= 1 && broken_hits[[1]]$startLine == 1 && broken_hits[[1]]$endLine == 1)
+
+# No RStudio session in this headless harness — every entry point must
 # degrade to a clean error/unavailable rather than throwing.
 check("align_annotate_selection degrades without rstudioapi",
       identical(align_annotate_selection()$error, "RStudio API not available."))
+check("align_annotate_range degrades without rstudioapi",
+      identical(align_annotate_range(6, 11)$error, "RStudio API not available."))
+fake_ctx <- list(id = "x", path = "/wd/volcano.R", contents = c(
+  "library(ggplot2)",
+  "df <- read.csv(\"volcano.csv\")",
+  "# Figure: Figure 1 [fig:w661mr] ----",
+  "p <- ggplot(df)",
+  "p"
+))
+whole_file <- .align_annotate_rows(fake_ctx, "volcano.R", 1, 5)
+check("a selection containing an existing marker is refused, naming the figure",
+      identical(whole_file$error, "That selection already contains a tracked figure (Figure 1). Select just the plot code."))
+adopt <- .align_annotate_rows(fake_ctx, "volcano.R", 3, 5)
+check("a selection STARTING on a marker adopts it instead of refusing",
+      isTRUE(adopt$reused) && identical(adopt$markerId, "w661mr") && identical(adopt$sourceCode, "p <- ggplot(df)\np"))
+check("align_annotate_range refuses a missing range before touching rstudioapi",
+      identical(align_annotate_range(NULL, NULL)$error, "A line range is required."))
 check("align_get_editor_context degrades without rstudioapi",
       isFALSE(align_get_editor_context()$available))
 
@@ -256,6 +332,9 @@ ann_http <- jsonlite::fromJSON(http_get("/annotate/context"))
 check("GET /annotate/context degrades over HTTP too", isFALSE(ann_http$available))
 ann_post <- post_json("/annotate", list())
 check("POST /annotate degrades over HTTP too", identical(ann_post$error, "RStudio API not available."))
+ann_range <- post_json("/annotate", list(startLine = 6, endLine = 11))
+check("POST /annotate with a line range routes to the range entry (DS-423)",
+      identical(ann_range$error, "RStudio API not available."))
 
 pending_empty <- jsonlite::fromJSON(http_get("/annotate/pending"), simplifyVector = FALSE)
 check("pending-annotation queue starts empty", length(pending_empty$annotations) == 0)
