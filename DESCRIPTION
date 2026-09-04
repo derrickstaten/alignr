@@ -1,6 +1,6 @@
 Package: alignr
 Title: Align Figure Layout for RStudio and Positron
-Version: 2026.9.4
+Version: 2026.9.4.1
 Authors@R: c(
     person("Derrick", "Staten", role = c("aut", "cre"), email = "statenderrick@gmail.com"),
     person("Align", role = "cph"))
