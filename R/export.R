@@ -24,7 +24,7 @@
 
 #' Writes a base64-encoded export payload (PNG/PDF/ZIP/PPTX bytes) to the
 #' working directory. `content_base64` is produced client-side by the
-#' plugin's exportAs implementation (packages/rstudio-host/src/export.ts) —
+#' plugin's exportAs implementation (packages/core/src/plugin-chrome/usePluginExport.ts) —
 #' the same bytes @align/core's export functions already produce for the web
 #' app's browser download, just base64-transported instead of blob-downloaded.
 #' Write-then-rename mirrors align_write_doc's crash-safety (docs.R).

@@ -37,6 +37,22 @@
 # them. It is written under ~/.align rather than R_user_dir() deliberately, so
 # a user who wants to revoke locally has one obvious place to delete.
 
+#' Which Align the plugin talks to (DS-452): production, no exceptions, for
+#' users — the sign-in card no longer offers a URL. The one override is the
+#' ALIGNR_SERVER environment variable (~/.Renviron, or Sys.setenv() before
+#' align_open()), for developing against a local dev server; when it is set
+#' the host reports `overridden = TRUE` and the pane shows an amber pill so a
+#' stale .Renviron can never masquerade as production.
+.ALIGN_PRODUCTION_SERVER <- "https://alignfigures.com"
+
+align_server_config <- function() {
+  override <- Sys.getenv("ALIGNR_SERVER", unset = "")
+  if (nzchar(override)) {
+    return(list(serverUrl = sub("/+$", "", override), overridden = TRUE))
+  }
+  list(serverUrl = .ALIGN_PRODUCTION_SERVER, overridden = FALSE)
+}
+
 #' The plugin's OAuth client id. A fixed, public, pre-registered id — see
 #' lib/oauth/first-party-clients.ts on the server for why this is not dynamic
 #' client registration. It is not a secret; PKCE is what proves possession.
@@ -288,9 +304,9 @@ ALIGN_OAUTH_SCOPE <- "align:ai"
   })
 }
 
-#' Start an OAuth sign-in against `server_url`.
+#' Start an OAuth sign-in against the resolved Align server (DS-452:
+#' production unless ALIGNR_SERVER is set — see align_server_config()).
 #'
-#' @param server_url Origin of the Align server (e.g. "https://align.app").
 #' @param mode "loopback" (default) binds a one-shot local listener for the
 #'   redirect; "code" redirects to Align's /oauth/code page for copy-paste,
 #'   which is the only thing that works when the browser and the R session are
@@ -298,11 +314,11 @@ ALIGN_OAUTH_SCOPE <- "align:ai"
 #' @return A list with `authorizeUrl` and `mode`, or `error`. Returns
 #'   immediately — the callback lands later on the event loop; poll
 #'   `align_oauth_status()`.
-align_signin <- function(server_url, mode = c("loopback", "code")) {
+align_signin <- function(mode = c("loopback", "code")) {
   mode <- match.arg(mode)
-  server_url <- .align_normalize_server(server_url)
+  server_url <- .align_normalize_server(align_server_config()$serverUrl)
   if (!nzchar(server_url) || !grepl("^https?://", server_url)) {
-    return(list(error = "Enter the Align server URL, e.g. https://align.app"))
+    return(list(error = paste0("ALIGNR_SERVER is not an http(s) URL: ", server_url)))
   }
   .align_release_listener()
   pkce <- .align_pkce_pair()
@@ -384,12 +400,20 @@ align_oauth_status <- function() {
   }
   stored <- .align_oauth_load()
   result <- .align_oauth$result
+  target <- align_server_config()$serverUrl
+  # A sign-in minted by a different Align than the one this plugin now
+  # targets (DS-452: a developer flipping ALIGNR_SERVER) must not be reused
+  # silently — it reads as signed out, with the reason, until the user signs
+  # in again against the resolved server.
+  mismatch <- !is.null(stored) && !identical(sub("/+$", "", stored$serverUrl), target)
   list(
-    signedIn = !is.null(stored),
-    serverUrl = if (!is.null(stored)) stored$serverUrl else if (!is.null(pending)) pending$serverUrl else NULL,
+    signedIn = !is.null(stored) && !mismatch,
+    serverUrl = if (!is.null(stored) && !mismatch) stored$serverUrl else if (!is.null(pending)) pending$serverUrl else NULL,
     pending = !is.null(pending),
     mode = if (!is.null(pending)) pending$mode else NULL,
-    error = if (!is.null(result) && !is.null(result$error)) result$error else NULL
+    error = if (!is.null(result) && !is.null(result$error)) result$error
+            else if (mismatch) paste0("You were signed in to ", stored$serverUrl, "; this plugin now targets ", target, ". Sign in again.")
+            else NULL
   )
 }
 

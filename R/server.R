@@ -156,26 +156,29 @@
       }
       if (method == "POST" && path == "/chat-connection") {
         b <- .align_read_body(req)
-        # An empty body clears — the pane's Disconnect action.
-        if (is.null(b$serverUrl) && is.null(b$token)) {
+        # An empty body clears — the pane's Disconnect action. The server is
+        # never taken from the pane (DS-452).
+        if (is.null(b$token)) {
           return(.align_json(align_clear_chat_connection()))
         }
-        return(.align_json(align_set_chat_connection(b$serverUrl, b$token)))
+        return(.align_json(align_set_chat_connection(align_server_config()$serverUrl, b$token)))
       }
       # ── OAuth sign-in (DS-273) ──────────────────────────────────────────
       # The pane can't run the flow itself (no system browser, no durable
       # storage), so it drives these five endpoints and the R side owns the
       # credential. Only /auth/token ever hands a secret to the pane, and it
       # is the short-lived access token — never the refresh token.
+      if (method == "GET" && path == "/auth/config") {
+        # Which Align this plugin talks to (DS-452) — resolved here, never
+        # chosen in the pane.
+        return(.align_json(align_server_config()))
+      }
       if (method == "GET" && path == "/auth/status") {
         return(.align_json(align_oauth_status()))
       }
       if (method == "POST" && path == "/auth/signin") {
         b <- .align_read_body(req)
-        return(.align_json(align_signin(
-          b$serverUrl,
-          mode = if (identical(b$mode, "code")) "code" else "loopback"
-        )))
+        return(.align_json(align_signin(mode = if (identical(b$mode, "code")) "code" else "loopback")))
       }
       if (method == "POST" && path == "/auth/code") {
         b <- .align_read_body(req)
@@ -231,6 +234,10 @@
 #'   the installed package's inst/www; a source-tree path works for dev.
 #' @param port Optional; a free port is chosen when NULL (see header).
 align_start <- function(www_root = system.file("www", package = "alignr"), port = NULL) {
+  cfg <- align_server_config()
+  if (isTRUE(cfg$overridden)) {
+    message("alignr: ALIGNR_SERVER is set - this plugin talks to ", cfg$serverUrl, ", not alignfigures.com.")
+  }
   if (!nzchar(www_root) || !file.exists(file.path(www_root, "index.html"))) {
     stop(
       "Align bundle not found (no index.html in '", www_root, "'). ",

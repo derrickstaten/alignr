@@ -440,15 +440,29 @@ check("refresh token round-trips through the file store",
       identical(stored$serverUrl, "https://align.app") && identical(stored$refreshToken, "align_rt_secret"))
 check("the token file is 0600 — no other local user may read it",
       identical(substr(as.character(file.mode(.align_oauth_file())), 1, 3), "600"))
+Sys.setenv(ALIGNR_SERVER = "https://align.app")
 check("status reports the stored sign-in", isTRUE(align_oauth_status()$signedIn))
+Sys.setenv(ALIGNR_SERVER = "https://other.example")
+check("a sign-in for another server reads as signed out, with the reason (DS-452)",
+      !isTRUE(align_oauth_status()$signedIn) && grepl("Sign in again", align_oauth_status()$error))
+Sys.setenv(ALIGNR_SERVER = "https://align.app")
 invisible(align_signout())
 check("sign-out forgets the stored sign-in",
       !isTRUE(align_oauth_status()$signedIn) && !file.exists(.align_oauth_file()))
 
-check("a non-URL server is refused before anything is opened",
-      is.character(align_signin("not a url")$error))
+# DS-452: the server is resolved host-side (production unless
+# ALIGNR_SERVER is set); the pane never sends one.
+Sys.unsetenv("ALIGNR_SERVER")
+check("without an override the plugin targets production",
+      identical(align_server_config(), list(serverUrl = "https://alignfigures.com", overridden = FALSE)))
+Sys.setenv(ALIGNR_SERVER = "not a url")
+check("a non-URL override is refused before anything is opened",
+      is.character(align_signin("loopback")$error))
+Sys.setenv(ALIGNR_SERVER = "http://127.0.0.1:1/")
+check("an override reports itself so the pane can show it",
+      isTRUE(align_server_config()$overridden) && identical(align_server_config()$serverUrl, "http://127.0.0.1:1"))
 
-signin <- align_signin("http://127.0.0.1:1/", mode = "loopback")
+signin <- align_signin(mode = "loopback")
 check("loopback sign-in returns an authorize URL immediately", is.character(signin$authorizeUrl))
 auth_url <- signin$authorizeUrl
 check("authorize URL carries PKCE S256", grepl("code_challenge_method=S256", auth_url, fixed = TRUE))
