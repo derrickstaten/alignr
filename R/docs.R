@@ -9,17 +9,24 @@
 
 # File names only — never paths. Anything with a separator or traversal is
 # rejected so the HTTP layer can't be walked out of the working directory.
+#
+# DS-449: the plugin's own documents are `.alignproj` (project documents: they
+# reference the user's scripts and hold none of their code), the default when
+# no extension is given. An explicit `.align` is accepted too — that is the
+# self-contained copy "Open in Align web" writes for the web to open.
 .align_safe_doc_name <- function(name) {
   name <- as.character(name)
   if (length(name) != 1 || is.na(name) || !nzchar(name)) return(NULL)
   if (grepl("[/\\\\]", name) || grepl("\\.\\.", name)) return(NULL)
-  if (!grepl("\\.align$", name)) name <- paste0(name, ".align")
+  if (!grepl("\\.(alignproj|align)$", name)) name <- paste0(name, ".alignproj")
   name
 }
 
-#' .align files in the working directory, newest first.
+#' The plugin's .alignproj documents in the working directory, newest first.
+#' Web-copy `.align` files are not listed: the plugin never opens them
+#' (DS-449 — it would have to put their code somewhere).
 align_list_docs <- function() {
-  files <- list.files(getwd(), pattern = "\\.align$", full.names = FALSE)
+  files <- list.files(getwd(), pattern = "\\.alignproj$", full.names = FALSE)
   if (length(files) == 0) return(list())
   info <- file.info(file.path(getwd(), files))
   ord <- order(info$mtime, decreasing = TRUE)

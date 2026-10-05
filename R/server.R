@@ -140,6 +140,11 @@
       if (method == "GET" && path == "/annotate/context") {
         return(.align_json(align_get_editor_context()))
       }
+      if (method == "POST" && path == "/insert-figure") {
+        # DS-449: every plugin add path writes its figure into the script.
+        b <- .align_read_body(req)
+        return(.align_json(align_insert_figure(b$code, b$label, isTRUE(b$allowNew))))
+      }
       if (method == "POST" && path == "/apply-edit") {
         b <- .align_read_body(req)
         return(.align_json(align_apply_file_edit(b$filePath, b$markerId, b$code)))

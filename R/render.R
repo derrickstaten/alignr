@@ -20,6 +20,17 @@
 #' @param font_scale Exposed to user code as `font_scale`, same as the web app.
 #' @return list(svg = <string>|NULL, error = <string>|NULL) — errors are data,
 #'   never conditions, so the HTTP layer can pass them straight through.
+#' Plot-like values the dispatch will draw — kept identical to
+#' lib/webr-render.ts's .align_renderable so a figure renders the same in the
+#' plugin and on the web.
+.align_renderable <- function(x) {
+  !is.null(x) && (
+    is.function(x) ||
+    inherits(x, c("grob", "gTree", "gList", "gg", "ggplot", "Heatmap",
+                  "HeatmapList", "trellis", "recordedplot"))
+  )
+}
+
 align_render_svg <- function(code, width_inches = 6, height_inches = 4, font_scale = 1) {
   devices_before <- grDevices::dev.cur()
   # File-backed svglite rather than svgstring(): svglite 2.2.1's svgstring
@@ -35,7 +46,20 @@ align_render_svg <- function(code, width_inches = 6, height_inches = 4, font_sca
   tryCatch({
     env <- new.env(parent = globalenv())
     env$font_scale <- font_scale
-    eval(parse(text = code), envir = env)
+    # Expression by expression, keeping the last value: a script figure
+    # usually ENDS with its plot (`ggplot(df, ...) + geom_point()`) rather
+    # than assigning it to `p`, and that region must render the same as it
+    # does when the user runs it (DS-449 live finding — it rendered nothing,
+    # with a cryptic error). Same dispatch as the web's WebR wrapper
+    # (lib/webr-render.ts, ALI-229): an explicit `p` wins, then a renderable
+    # final value, then whatever the code drew on the device itself.
+    last <- NULL
+    for (expr in parse(text = code)) {
+      last <- eval(expr, envir = env)
+    }
+    if (!exists("p", envir = env, inherits = FALSE) && .align_renderable(last)) {
+      env$p <- last
+    }
     .align_render <- function(x) {
       if (inherits(x, c("grob", "gTree", "gList"))) {
         grid::grid.draw(x)
@@ -54,8 +78,10 @@ align_render_svg <- function(code, width_inches = 6, height_inches = 4, font_sca
   grDevices::dev.off()
   stopifnot(grDevices::dev.cur() == devices_before)
   if (!ok) return(list(svg = NULL, error = err))
-  if (!file.exists(tmp)) {
-    return(list(svg = NULL, error = "The code ran but didn't draw anything — assign a plot (ggplot, grob, or function) to `p`."))
+  # svglite leaves an empty file, not a missing one, when nothing was drawn
+  # — that used to come back as an empty SVG with no error at all.
+  if (!file.exists(tmp) || file.size(tmp) == 0) {
+    return(list(svg = NULL, error = "The code ran but didn't draw anything — end it with the plot, or assign the plot (ggplot, grob, or function) to `p`."))
   }
   svg <- paste(readLines(tmp, warn = FALSE), collapse = "\n")
   # Coerce defensively to a length-1 string (spike guard; see header).

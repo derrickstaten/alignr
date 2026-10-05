@@ -172,15 +172,19 @@ dir.create(docdir, showWarnings = FALSE)
 oldwd <- setwd(docdir)
 snapshot_json <- '{"schemaVersion":2.1,"meta":{"id":"t3","name":"T3 doc"},"pages":[]}'
 w <- post_json("/doc/write", list(name = "t3-test", content = snapshot_json))
-check("doc write returns normalized name", identical(w$name, "t3-test.align"))
-check("doc file exists on disk", file.exists(file.path(docdir, "t3-test.align")))
+check("doc write defaults to .alignproj (DS-449)", identical(w$name, "t3-test.alignproj"))
+check("doc file exists on disk", file.exists(file.path(docdir, "t3-test.alignproj")))
+wc <- post_json("/doc/write", list(name = "t3-test.align", content = snapshot_json))
+check("an explicit .align (the web copy) is kept", identical(wc$name, "t3-test.align"))
 lst <- jsonlite::fromJSON(http_get("/doc/list"), simplifyVector = FALSE)
-check("doc list includes the file", any(vapply(lst$docs, function(d) d$name == "t3-test.align", logical(1))))
-rd <- http_get("/doc/read/t3-test.align")
+names_listed <- vapply(lst$docs, function(d) d$name, character(1))
+check("doc list shows the project document", "t3-test.alignproj" %in% names_listed)
+check("doc list hides the web copy", !("t3-test.align" %in% names_listed))
+rd <- http_get("/doc/read/t3-test.alignproj")
 check("doc read round-trips exact bytes", identical(jsonlite::fromJSON(rd)$meta$name, "T3 doc"))
 bad <- post_json("/doc/write", list(name = "../evil", content = "x"))
 check("doc name traversal rejected", identical(bad$error, "Invalid document name."))
-missing <- jsonlite::fromJSON(http_get("/doc/read/nope.align"))
+missing <- jsonlite::fromJSON(http_get("/doc/read/nope.alignproj"))
 check("missing doc reads as JSON error", identical(missing$error, "Document not found."))
 
 # ── Tracked-file stat/read over HTTP (ALI-198 T1) ────────────────────────────
@@ -514,6 +518,53 @@ check("ALIGNR_SERVER overrides and is trimmed", identical(.align_release_server(
 check("unreachable server is a silent NULL", is.null(.align_fetch_deployed_commit("https://example.invalid")))
 check("dev bundle (no version) skips the check silently", is.null(.align_check_release_version(tempfile("nowhere"))))
 Sys.unsetenv("ALIGNR_SERVER")
+
+# ── Bare-plot regions (DS-449 follow-up) ───────────────────────────────────
+rb <- align_render_svg('ggplot(mtcars, aes(wt, mpg)) + geom_point()')
+check("a region ending in a bare ggplot renders", is.null(rb$error) && grepl("<svg", rb$svg, fixed = TRUE))
+rn <- align_render_svg('x <- 1')
+check("code that draws nothing says so (no empty SVG)", is.null(rn$svg) && grepl("didn't draw anything", rn$error, fixed = TRUE))
+rp <- align_render_svg('p <- ggplot(mtcars, aes(wt, mpg)) + geom_point(); ggplot(mtcars, aes(mpg)) + geom_histogram(bins = 5)')
+check("an assigned p still wins over the last value", is.null(rp$error) && grepl("<svg", rp$svg, fixed = TRUE))
+rbase <- align_render_svg('plot(1:10)')
+check("base graphics still render", is.null(rbase$error) && grepl("<svg", rbase$svg, fixed = TRUE))
+rinv <- align_render_svg('x <- 5; invisible(x)')
+check("a non-plot last value is not treated as the plot", grepl("didn't draw anything", rinv$error, fixed = TRUE))
+
+# ── End markers and insert placement (DS-449) ───────────────────────────────
+lines_end <- c(
+  "df <- data.frame(x = 1)",
+  "# Figure: Sales [fig:e1] ----",
+  "p <- ggplot2::ggplot(df)",
+  "# ---- end fig:e1",
+  "summary(df)"
+)
+re1 <- .align_find_marker_region(lines_end, "e1")
+check("end marker closes the region", isTRUE(re1$found) && re1$startLine == 3 && re1$endLine == 3)
+check("end marker line reads as marked, code below it does not",
+      identical(.align_marked_line_mask(lines_end), c(FALSE, TRUE, TRUE, TRUE, FALSE)))
+check("another figure's end marker doesn't close this one",
+      .align_find_marker_region(c("# Figure: A [fig:a1] ----", "p <- 1", "# ---- end fig:zz", "q <- 2"), "a1")$endLine == 4)
+check("unmarked plot below a closed figure is still found",
+      length(align_scan_unmarked_plots(paste(c(lines_end, "p2 <- ggplot2::ggplot(df)"), collapse = "\n"))) == 1)
+
+script <- c(
+  "library(ggplot2)",           # 1
+  "p <- ggplot(mtcars) +",      # 2
+  "  geom_point(aes(wt, mpg))", # 3
+  "",                           # 4
+  "# Figure: A [fig:a1] ----",  # 5
+  "pa <- 1",                    # 6
+  "# ---- end fig:a1",          # 7
+  "x <- 2"                      # 8
+)
+check("insert: cursor mid-expression goes after the expression", .align_insert_after_line(script, 2) == 3)
+check("insert: cursor on a blank line goes right below it", .align_insert_after_line(script, 4) == 4)
+check("insert: cursor inside a figure goes after its end marker", .align_insert_after_line(script, 6) == 7)
+check("insert: open-ended figure is never split", .align_insert_after_line(c("# Figure: B [fig:b1] ----", "pb <- 1", "pb2 <- 2"), 2) == 3)
+check("insert: empty file goes at the top", .align_insert_after_line(character(0), 1) == 0)
+check("insert: unparseable file falls back to the end", .align_insert_after_line(c("p <- ggplot(", "x <- 1"), 1) == 2)
+check("end marker never parses as a figure marker", !grepl("^\\s*#\\s*Figure:", .align_end_marker_line("e1")) && grepl(.align_end_marker_re, .align_end_marker_line("e1")))
 
 cat(sprintf("\n%d passed, %d failed\n", passed, failed))
 if (failed > 0) quit(status = 1)

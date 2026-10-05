@@ -28,7 +28,8 @@
 #' Mirrors file-region-utils.ts's parseFileRegions/findRegionById — kept in
 #' sync by hand across the R/TS boundary, same caveat noted in annotate.R's
 #' .align_marker_line. Region = the lines strictly after the marker line
-#' through the line before the next marker (any id), or EOF.
+#' through the line before its own end marker (DS-449), else the next marker
+#' (any id), else EOF.
 .align_find_marker_region <- function(lines, marker_id) {
   marker_re <- "^\\s*#\\s*Figure:.*\\[fig:([A-Za-z0-9_-]+)\\]\\s*-{4,}\\s*$"
   marker_lines <- grep(marker_re, lines)
@@ -41,7 +42,7 @@
   idx <- matches[1]
   start_line <- marker_lines[idx] + 1
   later_markers <- marker_lines[marker_lines > marker_lines[idx]]
-  end_line <- if (length(later_markers) > 0) later_markers[1] - 1 else length(lines)
+  end_line <- .align_region_bounds(lines, marker_lines[idx], if (length(later_markers) > 0) later_markers[1] else NA, marker_id)$bodyEnd
   # A marker on the file's last line has an empty region (start_line > end_line)
   # — valid (an empty figure body), callers just get zero replaced lines.
 
@@ -90,7 +91,10 @@ align_apply_file_edit <- function(file_path, marker_id, code) {
   # and zero-AI, so prompt drift can't reintroduce it.
   marker_line_re <- "^\\s*#\\s*Figure:.*\\[fig:[A-Za-z0-9_-]+\\]\\s*-{4,}\\s*$"
   code_lines <- strsplit(as.character(code), "\r\n|\r|\n")[[1]]
-  code <- paste(code_lines[!grepl(marker_line_re, code_lines)], collapse = "\n")
+  # End markers too (DS-449): the region's own end marker stays in the file
+  # below the replaced range, so a body carrying one would close it early.
+  keep <- !grepl(marker_line_re, code_lines) & !grepl(.align_end_marker_re, code_lines)
+  code <- paste(code_lines[keep], collapse = "\n")
 
   # Whole-line replacement: start of the region's first line through the
   # start of the line just past its last — covers the region's own trailing

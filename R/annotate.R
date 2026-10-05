@@ -54,6 +54,29 @@
   sprintf("# Figure: %s [fig:%s] ----", safe_label, marker_id)
 }
 
+#' `# ---- end fig:<id>` closes the region it names (DS-449) — same syntax as
+#' file-region-utils.ts's buildEndMarkerLine. Leading dashes on purpose:
+#' RStudio folds comment lines that END in dashes, so this never shows up as
+#' a section of its own.
+.align_end_marker_re <- "^\\s*#\\s*-{4,}\\s*end\\s+fig:([A-Za-z0-9_-]+)\\s*$"
+.align_end_marker_line <- function(marker_id) sprintf("# ---- end fig:%s", marker_id)
+
+#' Where a region ends: `bodyEnd` is its last body line, `closeLine` its own
+#' end marker (NA when it has none). Without an end marker the region runs to
+#' the line before `next_marker_line` (NA = EOF), the pre-DS-449 rule markers
+#' written by hand keep.
+.align_region_bounds <- function(lines, marker_line, next_marker_line, marker_id) {
+  limit <- if (is.na(next_marker_line)) length(lines) else next_marker_line - 1
+  if (marker_line + 1 <= limit) {
+    for (i in (marker_line + 1):limit) {
+      if (grepl(.align_end_marker_re, lines[i]) && sub(.align_end_marker_re, "\\1", lines[i]) == marker_id) {
+        return(list(bodyEnd = i - 1, closeLine = i))
+      }
+    }
+  }
+  list(bodyEnd = limit, closeLine = NA)
+}
+
 #' Code that reads as "this draws a figure". Deliberately broad and zero-LLM
 #' (Round 4.B): a false positive is a card nobody clicks, a false negative is
 #' a figure the user has to select by hand via the fallback link.
@@ -62,16 +85,121 @@
 #' TRUE for every line that sits inside an existing marker region (a marker
 #' line through the line before the next marker, or EOF).
 .align_marked_line_mask <- function(lines) {
-  marker_lines <- grep("^\\s*#\\s*Figure:.*\\[fig:[A-Za-z0-9_-]+\\]\\s*-{4,}\\s*$", lines)
+  marker_re <- "^\\s*#\\s*Figure:.*\\[fig:([A-Za-z0-9_-]+)\\]\\s*-{4,}\\s*$"
+  marker_lines <- grep(marker_re, lines)
   mask <- logical(length(lines))
   if (length(marker_lines) > 0) {
     for (i in seq_along(marker_lines)) {
       start <- marker_lines[i]
-      end <- if (i < length(marker_lines)) marker_lines[i + 1] - 1 else length(lines)
-      mask[start:end] <- TRUE
+      bounds <- .align_region_bounds(lines, start,
+        if (i < length(marker_lines)) marker_lines[i + 1] else NA,
+        sub(marker_re, "\\1", lines[start]))
+      end <- if (is.na(bounds$closeLine)) bounds$bodyEnd else bounds$closeLine
+      mask[start:max(start, end)] <- TRUE
     }
   }
   mask
+}
+
+#' The line a new figure goes after (0 = the top of an empty file), for a
+#' cursor on `cursor_row` (DS-449). Pure, so the harness can test it.
+#'
+#' Never inside an existing figure: a cursor in a tracked region puts the new
+#' one after that region (its end marker, or where it runs out), since a
+#' marker dropped mid-region would cut the figure above it in two. Never
+#' inside a statement either: a cursor in a multi-line top-level expression
+#' puts it after the expression's last line (srcrefs, as
+#' align_scan_unmarked_plots uses). Otherwise right below the cursor line.
+#' An unparseable file (mid-edit typo) falls back to the end.
+.align_insert_after_line <- function(lines, cursor_row) {
+  n <- length(lines)
+  if (n == 0) return(0L)
+  cursor_row <- max(1L, min(as.integer(cursor_row), n))
+
+  marker_re <- "^\\s*#\\s*Figure:.*\\[fig:([A-Za-z0-9_-]+)\\]\\s*-{4,}\\s*$"
+  marker_lines <- grep(marker_re, lines)
+  for (i in seq_along(marker_lines)) {
+    start <- marker_lines[i]
+    bounds <- .align_region_bounds(lines, start,
+      if (i < length(marker_lines)) marker_lines[i + 1] else NA,
+      sub(marker_re, "\\1", lines[start]))
+    end <- if (is.na(bounds$closeLine)) bounds$bodyEnd else bounds$closeLine
+    if (cursor_row >= start && cursor_row <= end) return(as.integer(max(start, end)))
+  }
+
+  exprs <- tryCatch(suppressWarnings(parse(text = lines, keep.source = TRUE)), error = function(e) NULL)
+  if (is.null(exprs)) return(as.integer(n))
+  for (ref in attr(exprs, "srcref")) {
+    if (ref[[1L]] <= cursor_row && ref[[3L]] >= cursor_row) return(as.integer(ref[[3L]]))
+  }
+  as.integer(cursor_row)
+}
+
+#' Writes a new figure into the active R script and returns it as a tracked
+#' region (DS-449): every plugin add path — starter, table chart, template,
+#' AI-created figure — puts its code in the user's script, never only in the
+#' document, because the script is the one copy of their code. Inserted as
+#' an unsaved edit below the cursor (see .align_insert_after_line), wrapped
+#' in a marker and an end marker so code typed later below it stays out.
+#'
+#' With no saved R script focused it refuses and says what to open, except
+#' for `allow_new` (the built-in example): that opens the code in a new
+#' untitled script, which the user saves and then adds from the Add tab —
+#' Align never creates or saves a file itself.
+#'
+#' @return list(filePath, markerId, label, sourceCode) or list(error=).
+align_insert_figure <- function(code, label = NULL, allow_new = FALSE) {
+  if (!requireNamespace("rstudioapi", quietly = TRUE) || !rstudioapi::isAvailable()) {
+    return(list(error = "RStudio API not available."))
+  }
+  code_lines <- strsplit(sub("\\s+$", "", as.character(code)), "\r\n|\r|\n")[[1]]
+  # The source editor's active tab, not getActiveDocumentContext(): that one
+  # answers with the console whenever the user last typed there, which made
+  # an add refuse while the script sat open right beside it (live finding).
+  ctx <- tryCatch(rstudioapi::getSourceEditorContext(), error = function(e) NULL)
+  is_r_script <- !is.null(ctx) && nzchar(ctx$path) && grepl("\\.[Rr]$", ctx$path)
+
+  if (!is_r_script) {
+    if (isTRUE(allow_new)) {
+      marker_id <- .align_generate_marker_id()
+      block <- c(.align_marker_line(if (is.null(label)) "Figure 1" else label, marker_id), code_lines, .align_end_marker_line(marker_id))
+      rstudioapi::documentNew(text = paste0(paste(block, collapse = "\n"), "\n"), type = "r")
+      return(list(error = "Opened the example in a new script. Save it in your project, then add it from the Add tab."))
+    }
+    return(list(error = "Open the R script this figure should live in, then try again — Align writes the figure's code there."))
+  }
+  rel_path <- .align_rel_from_abs(ctx$path)
+  if (is.null(rel_path)) {
+    return(list(error = "This script is outside the R working directory. Set the working directory to its folder (Session > Set Working Directory) and try again."))
+  }
+
+  lines <- ctx$contents
+  if (length(lines) == 1 && !nzchar(lines)) lines <- character(0)
+  cursor_row <- tryCatch(ctx$selection[[1]]$range$start[[1]], error = function(e) length(lines))
+  after <- .align_insert_after_line(lines, cursor_row)
+
+  marker_id <- .align_generate_marker_id()
+  if (is.null(label) || !nzchar(label)) label <- .align_default_marker_label(paste(lines, collapse = "\n"))
+  block <- c(.align_marker_line(label, marker_id), code_lines, .align_end_marker_line(marker_id))
+
+  if (after == 0) {
+    rstudioapi::insertText(rstudioapi::document_position(1, 1), paste0(paste(block, collapse = "\n"), "\n"), id = ctx$id)
+  } else {
+    # Appended to the end of line `after`, with a blank line above and, when
+    # code follows directly, below — so the figure reads as its own block.
+    following_blank <- after >= length(lines) || !nzchar(trimws(lines[after + 1]))
+    text <- paste0("\n\n", paste(block, collapse = "\n"), if (following_blank) "" else "\n")
+    rstudioapi::insertText(rstudioapi::document_position(after, nchar(lines[after]) + 1), text, id = ctx$id)
+  }
+  # Deliberately no documentSave() — Align never saves the user's file.
+
+  list(filePath = rel_path, markerId = marker_id, label = .align_marker_label_text(label), sourceCode = paste(code_lines, collapse = "\n"))
+}
+
+#' The label as it ends up in the marker line (brackets stripped, trimmed).
+.align_marker_label_text <- function(label) {
+  safe <- trimws(gsub("[][]", "", label))
+  if (nzchar(safe)) safe else "Untitled"
 }
 
 #' Comment lines never contain runnable plotting code — prose like "select
