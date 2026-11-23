@@ -58,10 +58,16 @@ align_server_config <- function() {
 #' client registration. It is not a secret; PKCE is what proves possession.
 ALIGN_OAUTH_CLIENT_ID <- "align-rstudio-plugin"
 
-#' The one scope the plugin asks for. AI chat only — the plugin has no code
-#' that touches documents over MCP, and asking for `align:docs` would be
-#' consent it cannot honestly spend.
-ALIGN_OAUTH_SCOPE <- "align:ai"
+#' The one scope the plugin asks for (DS-1029): `align:plugin`, Align AI chat
+#' plus the cloud documents the plugin opens, edits and creates. Never the MCP
+#' connector's `align:docs*` vocabulary.
+ALIGN_OAUTH_SCOPE <- "align:plugin"
+
+#' The RFC 8707 audience the plugin's token is minted for (DS-1029). Accepted
+#' by /api/ai and by the cloud-document routes. A token from a sign-in before
+#' DS-1029 was minted for "/api/ai": it still chats, but the document routes
+#' refuse it, so the plugin asks the user to sign in again.
+ALIGN_OAUTH_RESOURCE_PATH <- "/api/plugin"
 
 #' Refresh with this much life left on the access token rather than waiting
 #' for expiry: a token that expires mid-request surfaces to the user as a chat
@@ -364,7 +370,7 @@ align_signin <- function(mode = c("loopback", "code")) {
       paste0("state=", utils::URLencode(state, reserved = TRUE)),
       paste0("code_challenge=", pkce$challenge),
       "code_challenge_method=S256",
-      paste0("resource=", utils::URLencode(paste0(server_url, "/api/ai"), reserved = TRUE))
+      paste0("resource=", utils::URLencode(paste0(server_url, ALIGN_OAUTH_RESOURCE_PATH), reserved = TRUE))
     ),
     collapse = "&"
   )

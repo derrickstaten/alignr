@@ -41,6 +41,12 @@ align_render_svg <- function(code, width_inches = 6, height_inches = 4, font_sca
   tmp <- tempfile(fileext = ".svg")
   on.exit(unlink(tmp), add = TRUE)
   svglite::svglite(tmp, width = width_inches, height = height_inches)
+  # DS-1032: code that ends in ggsave("figure.svg") / svg() + dev.off()
+  # draws nothing on Align's device, only into its own file. The web sweeps
+  # its mount directory for such a file (lib/webr-render.ts, ALI-236); here
+  # the code runs in the person's working directory, so note the .svg files
+  # there before it runs and pick up one it wrote. Their file is left alone.
+  svg_before <- .align_svg_snapshot()
   ok <- TRUE
   err <- NULL
   tryCatch({
@@ -81,11 +87,31 @@ align_render_svg <- function(code, width_inches = 6, height_inches = 4, font_sca
   # svglite leaves an empty file, not a missing one, when nothing was drawn
   # — that used to come back as an empty SVG with no error at all.
   if (!file.exists(tmp) || file.size(tmp) == 0) {
+    written <- .align_svg_written_since(svg_before)
+    if (length(written) == 1) {
+      svg <- paste(readLines(written, warn = FALSE), collapse = "\n")
+      return(list(svg = paste(as.character(svg), collapse = ""), error = NULL))
+    }
     return(list(svg = NULL, error = "The code ran but didn't draw anything — end it with the plot, or assign the plot (ggplot, grob, or function) to `p`."))
   }
   svg <- paste(readLines(tmp, warn = FALSE), collapse = "\n")
   # Coerce defensively to a length-1 string (spike guard; see header).
   list(svg = paste(as.character(svg), collapse = ""), error = NULL)
+}
+
+# The .svg files in the working directory and their modification times
+# (DS-1032), so a render can tell which one the figure's code just wrote.
+.align_svg_snapshot <- function(dir = getwd()) {
+  files <- list.files(dir, pattern = "\\.svg$", full.names = TRUE, ignore.case = TRUE)
+  stats::setNames(as.numeric(file.mtime(files)), files)
+}
+
+# Files created or rewritten since `before` — the sweep counts only what this
+# render produced, like the web's before/after diff (ALI-236).
+.align_svg_written_since <- function(before, dir = getwd()) {
+  now <- .align_svg_snapshot(dir)
+  changed <- names(now)[is.na(before[names(now)]) | now > before[names(now)]]
+  changed[file.size(changed) > 0]
 }
 
 #' Data frames currently in the user's global environment.

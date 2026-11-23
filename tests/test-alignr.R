@@ -20,6 +20,7 @@ source("R/server.R")
 source("R/oauth.R")
 source("R/handoff.R")
 source("R/describe.R")
+source("R/store.R")
 
 passed <- 0L
 failed <- 0L
@@ -472,10 +473,10 @@ auth_url <- signin$authorizeUrl
 check("authorize URL carries PKCE S256", grepl("code_challenge_method=S256", auth_url, fixed = TRUE))
 check("authorize URL names the pre-registered client",
       grepl("client_id=align-rstudio-plugin", auth_url, fixed = TRUE))
-check("authorize URL asks for align:ai and nothing else",
-      grepl("scope=align%3Aai", auth_url, fixed = TRUE) && !grepl("align%3Adocs", auth_url))
-check("authorize URL names the AI resource as its audience",
-      grepl("resource=http%3A%2F%2F127.0.0.1%3A1%2Fapi%2Fai", auth_url, fixed = TRUE))
+check("authorize URL asks for align:plugin and nothing else (DS-1029)",
+      grepl("scope=align%3Aplugin", auth_url, fixed = TRUE) && !grepl("align%3Adocs", auth_url))
+check("authorize URL names the plugin resource as its audience (DS-1029)",
+      grepl("resource=http%3A%2F%2F127.0.0.1%3A1%2Fapi%2Fplugin", auth_url, fixed = TRUE))
 check("loopback redirect_uri is a 127.0.0.1 /callback on a bound port",
       grepl("redirect_uri=http%3A%2F%2F127.0.0.1%3A[0-9]+%2Fcallback", auth_url))
 check("a listener is bound while the flow is open", !is.null(.align_oauth$listener))
@@ -565,6 +566,63 @@ check("insert: open-ended figure is never split", .align_insert_after_line(c("# 
 check("insert: empty file goes at the top", .align_insert_after_line(character(0), 1) == 0)
 check("insert: unparseable file falls back to the end", .align_insert_after_line(c("p <- ggplot(", "x <- 1"), 1) == 2)
 check("end marker never parses as a figure marker", !grepl("^\\s*#\\s*Figure:", .align_end_marker_line("e1")) && grepl(.align_end_marker_re, .align_end_marker_line("e1")))
+
+
+# ---------------------------------------------------------------------------
+# DS-1033: the pane's durable store. A cloud document's unsent edits live
+# here because the pane's own localStorage dies with each random port.
+# ---------------------------------------------------------------------------
+store_home <- tempfile("align-store-")
+old_data_home <- Sys.getenv("R_USER_DATA_DIR", unset = NA)
+Sys.setenv(R_USER_DATA_DIR = store_home)
+check("an empty store lists nothing", length(align_store_list("align:")$entries) == 0)
+check("set accepts a string", isTRUE(align_store_set("align:document:d1:sync-queue", "{\"v\":1}")$ok))
+check("keys with colons and slashes round-trip exactly",
+      isTRUE(align_store_set("align:plugin:last-cloud-doc", "doc/with:odd?chars")$ok) &&
+      identical(align_store_list("align:plugin:")$entries[["align:plugin:last-cloud-doc"]], "doc/with:odd?chars"))
+check("a prefix listing returns only its own keys",
+      identical(names(align_store_list("align:document:d1:")$entries), "align:document:d1:sync-queue"))
+check("NULL removes a key", isTRUE(align_store_set("align:document:d1:sync-queue", NULL)$ok) &&
+      length(align_store_list("align:document:d1:")$entries) == 0)
+check("a missing key is refused, not a throw", is.character(align_store_set("", "x")$error))
+check("stored files are owner-only",
+      { f <- list.files(file.path(store_home, "R", "alignr"), recursive = TRUE, full.names = TRUE); length(f) == 0 || all(file.mode(f) == as.octmode("600")) })
+if (is.na(old_data_home)) Sys.unsetenv("R_USER_DATA_DIR") else Sys.setenv(R_USER_DATA_DIR = old_data_home)
+
+# ---------------------------------------------------------------------------
+# DS-1032: code that saves its own SVG (ggsave) renders, like on the web.
+# ---------------------------------------------------------------------------
+sweep_dir <- tempfile("align-sweep-")
+dir.create(sweep_dir)
+old_wd <- setwd(sweep_dir)
+res <- align_render_svg('ggplot2::ggsave("out.svg", ggplot2::ggplot(mtcars, ggplot2::aes(wt, mpg)) + ggplot2::geom_point(), width = 4, height = 3)', 4, 3)
+check("a figure that only ggsave()s an svg still renders", is.null(res$error) && grepl("<svg", res$svg))
+check("the person's own svg file is left in place", file.exists(file.path(sweep_dir, "out.svg")))
+res2 <- align_render_svg('x <- 1', 4, 3)
+check("a region that draws nothing and writes nothing still says so", is.null(res2$svg) && grepl("didn't draw anything", res2$error))
+setwd(old_wd)
+
+# ── DS-1033: the storage proxy fetches only Align's presigned R2 URLs ──
+sig <- "?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=abc"
+check("proxy: a presigned R2 URL is allowed",
+      .align_storage_url_allowed(paste0("https://0123abcd.r2.cloudflarestorage.com/align-documents/shared-docs/d/k", sig), dev_override = FALSE))
+check("proxy: a virtual-hosted R2 URL (bucket in the host, as R2 presigns) is allowed",
+      .align_storage_url_allowed(paste0("https://align-dev.c12ad8b9009e9ce6131a3c3a0adcc013.r2.cloudflarestorage.com/shared-docs/d/checkpoints/h", sig), dev_override = FALSE))
+check("proxy: an unsigned R2 URL is refused",
+      !.align_storage_url_allowed("https://0123abcd.r2.cloudflarestorage.com/align-documents/k", dev_override = FALSE))
+check("proxy: another host is refused, signature or not",
+      !.align_storage_url_allowed(paste0("https://evil.example.com/k", sig), dev_override = FALSE))
+check("proxy: a lookalike host is refused",
+      !.align_storage_url_allowed(paste0("https://x.r2.cloudflarestorage.com.evil.example/k", sig), dev_override = FALSE))
+check("proxy: plain http to R2 is refused",
+      !.align_storage_url_allowed(paste0("http://0123abcd.r2.cloudflarestorage.com/k", sig), dev_override = FALSE))
+check("proxy: loopback (the e2e stand-in) only with a dev server override",
+      .align_storage_url_allowed(paste0("http://127.0.0.1:3101/b/k", sig), dev_override = TRUE) &&
+      !.align_storage_url_allowed(paste0("http://127.0.0.1:3101/b/k", sig), dev_override = FALSE))
+check("proxy: a request without the method header is refused",
+      identical(.align_storage_proxy(list(QUERY_STRING = paste0("u=", utils::URLencode(paste0("https://a.r2.cloudflarestorage.com/k", sig), reserved = TRUE))))$status, 400L))
+check("proxy: a disallowed URL is refused before any network call",
+      identical(.align_storage_proxy(list(HTTP_X_ALIGN_STORAGE_METHOD = "GET", QUERY_STRING = paste0("u=", utils::URLencode("https://evil.example.com/k?X-Amz-Signature=x", reserved = TRUE))))$status, 403L))
 
 cat(sprintf("\n%d passed, %d failed\n", passed, failed))
 if (failed > 0) quit(status = 1)

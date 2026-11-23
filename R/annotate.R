@@ -269,7 +269,11 @@ align_scan_unmarked_plots <- function(content) {
   if (!requireNamespace("rstudioapi", quietly = TRUE) || !rstudioapi::isAvailable()) {
     return(list(error = "RStudio API not available."))
   }
-  ctx <- tryCatch(rstudioapi::getActiveDocumentContext(), error = function(e) NULL)
+  # The source editor's active tab, as in align_insert_figure: the plugin's
+  # "Add selection" button is clicked from the Viewer, and
+  # getActiveDocumentContext() answers with the console whenever the user
+  # last typed there (DS-1034 run-through).
+  ctx <- tryCatch(rstudioapi::getSourceEditorContext(), error = function(e) NULL)
   if (is.null(ctx) || !nzchar(ctx$path)) {
     return(list(error = "Save the file first — Align tracks files on disk, not unsaved editors."))
   }
@@ -394,7 +398,11 @@ align_get_editor_context <- function() {
   if (!requireNamespace("rstudioapi", quietly = TRUE) || !rstudioapi::isAvailable()) {
     return(list(available = FALSE))
   }
-  ctx <- tryCatch(rstudioapi::getActiveDocumentContext(), error = function(e) NULL)
+  # The source editor's active tab, not getActiveDocumentContext(): that one
+  # answers with the console whenever the user last typed there, so the Add
+  # tab said "Open an R script…" with the script open beside it (DS-1034
+  # run-through, 2026-11-23; same trap align_insert_figure already avoids).
+  ctx <- tryCatch(rstudioapi::getSourceEditorContext(), error = function(e) NULL)
   if (is.null(ctx) || !nzchar(ctx$path)) {
     return(list(available = TRUE, path = NULL, hasSelection = FALSE, unmarkedPlots = list()))
   }

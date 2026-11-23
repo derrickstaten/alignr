@@ -156,6 +156,16 @@
         b <- .align_read_body(req)
         return(.align_json(align_set_chat_history(b$docId, b$json)))
       }
+      if (method == "GET" && startsWith(path, "/store/list")) {
+        # DS-1033: the pane's durable store (store.R) — a cloud document's
+        # unsent edits must outlive this session's random-port origin.
+        qs <- .align_parse_query(req$QUERY_STRING)
+        return(.align_json(align_store_list(if (is.null(qs$prefix)) "" else qs$prefix)))
+      }
+      if (method == "POST" && path == "/store/set") {
+        b <- .align_read_body(req)
+        return(.align_json(align_store_set(b$key, b$value)))
+      }
       if (method == "GET" && path == "/chat-connection") {
         return(.align_json(align_get_chat_connection()))
       }
@@ -194,6 +204,12 @@
       }
       if (method == "GET" && path == "/auth/token") {
         return(.align_json(align_oauth_access_token()))
+      }
+      if (method == "POST" && path == "/storage") {
+        # DS-1033: presigned storage requests the pane can't make itself
+        # (the bucket's CORS doesn't cover its loopback origin) — see
+        # storage_proxy.R for what is and isn't allowed.
+        return(.align_storage_proxy(req))
       }
       if (method == "POST" && path == "/open-web") {
         # Tier A "Open in Align web" (ALI-273): the Viewer pane can't reliably
