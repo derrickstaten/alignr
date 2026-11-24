@@ -71,10 +71,47 @@
   )
 }
 
+#' A fresh per-launch secret for the pane (DS-908, audit finding #2): 32 random
+#' bytes from openssl, hex-encoded. base R's RNG is not a cryptographic source.
+.align_nonce_new <- function() {
+  paste(as.character(openssl::rand_bytes(32)), collapse = "")
+}
+
+#' The only requests served without the pane secret: the bundle itself (DS-908).
+#' Everything else either runs R, touches files, or hands out a credential.
+.align_is_static_request <- function(method, path) {
+  identical(method, "GET") && (
+    path %in% c("/", "/index.html", "/build-stamp.json", "/favicon.ico") ||
+      startsWith(path, "/assets/") || startsWith(path, "/fonts/")
+  )
+}
+
+#' Whether a request carries this launch's secret in X-Align-Nonce (DS-908,
+#' audit finding #2).
+#'
+#' Until DS-908 the 127.0.0.1 bind was the only control, and it can't tell the
+#' user's own Viewer pane from another OS account on a shared RStudio Server
+#' host, or from a web page posting text/plain to the loopback port: any of them
+#' could POST /render (arbitrary R in this session) or GET /auth/token. The
+#' secret reaches the pane only through the URL fragment align_start() returns,
+#' which browsers never send over the network. Requiring it as a custom header
+#' also forces a CORS preflight for any cross-origin caller, which this server
+#' never approves. Digests are compared rather than the raw strings so the
+#' comparison doesn't leak a matching prefix through timing.
+.align_nonce_ok <- function(req) {
+  expected <- .align_state$nonce
+  got <- req$HTTP_X_ALIGN_NONCE
+  if (is.null(expected) || !is.character(got) || length(got) != 1L || !nzchar(got)) return(FALSE)
+  identical(as.character(openssl::sha256(got)), as.character(openssl::sha256(expected)))
+}
+
 .align_app <- function(www_root) {
   list(call = function(req) {
     path <- req$PATH_INFO
     method <- req$REQUEST_METHOD
+    if (!.align_is_static_request(method, path) && !.align_nonce_ok(req)) {
+      return(.align_json(list(error = "Forbidden"), status = 403L))
+    }
     tryCatch({
       if (method == "GET" && path == "/ready") {
         return(.align_json(list(ready = TRUE, r = R.version.string)))
@@ -249,7 +286,9 @@
   })
 }
 
-#' Start the Align server. Returns the URL.
+#' Start the Align server. Returns the URL to open, which carries this launch's
+#' pane secret in its fragment (`#align-nonce=...`, DS-908): open exactly this
+#' URL, because the bare origin can load the bundle but not call the server.
 #'
 #' @param www_root Directory holding the built rstudio-host bundle. Defaults to
 #'   the installed package's inst/www; a source-tree path works for dev.
@@ -270,8 +309,9 @@ align_start <- function(www_root = system.file("www", package = "alignr"), port 
   .align_check_release_version(www_root)
   align_stop()
   if (is.null(port)) port <- httpuv::randomPort()
+  .align_state$nonce <- .align_nonce_new()
   .align_state$server <- httpuv::startServer("127.0.0.1", port, .align_app(www_root))
-  .align_state$url <- sprintf("http://127.0.0.1:%d/", port)
+  .align_state$url <- sprintf("http://127.0.0.1:%d/#align-nonce=%s", port, .align_state$nonce)
   message("Align server: ", .align_state$url, " (lives with this R session; align_stop() to end)")
   invisible(.align_state$url)
 }
@@ -282,6 +322,7 @@ align_stop <- function() {
     httpuv::stopServer(.align_state$server)
     .align_state$server <- NULL
     .align_state$url <- NULL
+    .align_state$nonce <- NULL
   }
   invisible(NULL)
 }

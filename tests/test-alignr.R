@@ -21,6 +21,7 @@ source("R/oauth.R")
 source("R/handoff.R")
 source("R/describe.R")
 source("R/store.R")
+source("R/storage_proxy.R")
 
 passed <- 0L
 failed <- 0L
@@ -118,7 +119,12 @@ check("empty-argument calls like x[, 1] don't trip the walker",
 www <- file.path(tempdir(), "align-test-www")
 dir.create(www, showWarnings = FALSE)
 writeLines("<html><body>align test</body></html>", file.path(www, "index.html"))
-url <- align_start(www_root = www)
+pane_url <- align_start(www_root = www)
+# DS-908: align_start() returns the pane URL with this launch's secret in its
+# fragment; every non-bundle request must send it back as X-Align-Nonce.
+nonce <- sub("^.*#align-nonce=", "", pane_url)
+url <- sub("#.*$", "", pane_url)
+check("align_start() puts a 64-hex secret in the pane URL's fragment", grepl("^[0-9a-f]{64}$", nonce))
 
 # httpuv serves off later's event loop, which a same-process blocking client
 # would starve (deadlock -> timeout). So: fire curl in a subprocess and pump
@@ -136,7 +142,10 @@ http_raw <- function(curl_args) {
   if (!file.exists(outfile)) return("")
   paste(readLines(outfile, warn = FALSE), collapse = "\n")
 }
-http_get <- function(path) http_raw(shQuote(paste0(sub("/$", "", url), path)))
+http_get <- function(path, with_nonce = TRUE) http_raw(paste(
+  if (with_nonce) paste("-H", shQuote(paste0("X-Align-Nonce: ", nonce))) else "",
+  shQuote(paste0(sub("/$", "", url), path))
+))
 ready <- jsonlite::fromJSON(http_get("/ready"))
 check("/ready responds", isTRUE(ready$ready))
 vars_http <- jsonlite::fromJSON(http_get("/vars"), simplifyVector = FALSE)
@@ -144,11 +153,30 @@ check("/vars sees the session over HTTP", any(vapply(vars_http$vars, function(v)
 check("static index served", grepl("align test", http_get("/")))
 check("path traversal blocked", grepl("Not found", http_get("/../DESCRIPTION")))
 
+# DS-908, audit finding #2: without this launch's secret, nothing but the
+# bundle is served - not R execution, not session data, not the Align token.
+check("static index served without the secret", grepl("align test", http_get("/", with_nonce = FALSE)))
+check("/vars refused without the secret", identical(jsonlite::fromJSON(http_get("/vars", with_nonce = FALSE))$error, "Forbidden"))
+check("/auth/token refused without the secret", identical(jsonlite::fromJSON(http_get("/auth/token", with_nonce = FALSE))$error, "Forbidden"))
+check("/vars refused with a wrong secret", identical(jsonlite::fromJSON(http_raw(paste(
+  "-H", shQuote("X-Align-Nonce: 0000"), shQuote(paste0(sub("/$", "", url), "/vars"))
+)))$error, "Forbidden"))
+forged <- file.path(tempdir(), "v3a_forged_marker.txt")
+unlink(forged)
+forged_body <- tempfile()
+writeLines(as.character(jsonlite::toJSON(list(code = sprintf('writeLines("x", %s); p <- function() plot(1)', deparse(forged))), auto_unbox = TRUE)), forged_body)
+forged_res <- http_raw(paste(
+  "-X POST -H 'Content-Type: text/plain;charset=UTF-8' -H 'Origin: https://attacker.example'",
+  "-H", shQuote(paste0("Host: rebind.example:", sub("^.*:([0-9]+).*$", "\\1", url))),
+  "--data-binary", paste0("@", shQuote(forged_body)), shQuote(paste0(sub("/$", "", url), "/render"))
+))
+check("a cross-site text/plain POST /render without the secret runs no R", identical(jsonlite::fromJSON(forged_res)$error, "Forbidden") && !file.exists(forged))
+
 post_json <- function(path, body) {
   payload <- tempfile()
   writeLines(as.character(jsonlite::toJSON(body, auto_unbox = TRUE)), payload)
   jsonlite::fromJSON(http_raw(paste(
-    "-X POST -H 'Content-Type: application/json' --data-binary", paste0("@", shQuote(payload)),
+    "-X POST -H 'Content-Type: application/json' -H", shQuote(paste0("X-Align-Nonce: ", nonce)), "--data-binary", paste0("@", shQuote(payload)),
     shQuote(paste0(sub("/$", "", url), path))
   )))
 }
