@@ -275,21 +275,54 @@ ALIGN_OAUTH_RESOURCE_PATH <- "/api/plugin"
   list(ok = TRUE, serverUrl = pending$serverUrl)
 }
 
+#' HTML-escape text for the callback page. The error text comes from the
+#' query string, which any page that can navigate the browser to the
+#' listener controls, so it must never reach the page as markup (DS-908 #26).
+.align_html_escape <- function(x) {
+  x <- gsub("&", "&amp;", x, fixed = TRUE)
+  x <- gsub("<", "&lt;", x, fixed = TRUE)
+  x <- gsub(">", "&gt;", x, fixed = TRUE)
+  x <- gsub('"', "&quot;", x, fixed = TRUE)
+  gsub("'", "&#39;", x, fixed = TRUE)
+}
+
+#' Write the callback's HTML response. One place, so every page it returns
+#' goes through the same escaping (DS-908 #26).
+.align_callback_page <- function(ok, message) {
+  page <- if (ok) {
+    "<h2>Signed in to Align</h2><p>You can close this tab and return to RStudio.</p>"
+  } else {
+    paste0("<h2>Align sign-in failed</h2><p>", .align_html_escape(paste(message, collapse = " ")), "</p>")
+  }
+  list(
+    status = if (ok) 200L else 400L,
+    headers = list("Content-Type" = "text/html; charset=utf-8", "Cache-Control" = "no-store"),
+    body = paste0("<!doctype html><meta charset=utf-8><body style='font-family:sans-serif;padding:3rem'>", page)
+  )
+}
+
 #' The one-shot loopback app. Answers exactly one path and hands the browser a
 #' human-readable page either way — a bare 200 with no body reads, to someone
 #' staring at a browser tab, as the flow having silently failed.
+#'
+#' The state is checked before anything else, and a callback that fails it is
+#' answered without being recorded: it was not started by this session, so it
+#' must not replace what the pane shows for the sign-in in progress, and its
+#' error text is never reflected (DS-908 #26). The Align server echoes state
+#' on its error redirects too, so a real "access denied" still gets through.
 .align_callback_app <- function(expected_state) {
   list(call = function(req) {
     if (!identical(req$PATH_INFO, "/callback")) {
       return(list(status = 404L, headers = list("Content-Type" = "text/plain"), body = "Not found"))
     }
     qs <- .align_parse_query(req$QUERY_STRING)
-    result <- if (!is.null(qs$error)) {
-      list(error = as.character(.align_or(qs$error_description, qs$error)))
-    } else if (!identical(as.character(qs$state), expected_state)) {
+    if (!identical(as.character(qs$state), expected_state)) {
       # CSRF defence: a callback whose state does not match the one this
       # session generated was not started by this session.
-      list(error = "Sign-in state did not match. Start again from the plugin.")
+      return(.align_callback_page(FALSE, "Sign-in state did not match. Start again from the plugin."))
+    }
+    result <- if (!is.null(qs$error)) {
+      list(error = as.character(.align_or(qs$error_description, qs$error)))
     } else if (is.null(qs$code)) {
       list(error = "The browser came back without an authorization code.")
     } else {
@@ -297,16 +330,7 @@ ALIGN_OAUTH_RESOURCE_PATH <- "/api/plugin"
     }
     .align_oauth$result <- result
     if (isTRUE(result$ok)) .align_release_listener()
-    page <- if (isTRUE(result$ok)) {
-      "<h2>Signed in to Align</h2><p>You can close this tab and return to RStudio.</p>"
-    } else {
-      paste0("<h2>Align sign-in failed</h2><p>", result$error, "</p>")
-    }
-    list(
-      status = if (isTRUE(result$ok)) 200L else 400L,
-      headers = list("Content-Type" = "text/html; charset=utf-8", "Cache-Control" = "no-store"),
-      body = paste0("<!doctype html><meta charset=utf-8><body style='font-family:sans-serif;padding:3rem'>", page)
-    )
+    .align_callback_page(isTRUE(result$ok), result$error)
   })
 }
 

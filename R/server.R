@@ -48,8 +48,9 @@
   rel <- sub("^/", "", path)
   if (rel == "" || rel == "/") rel <- "index.html"
   file <- normalizePath(file.path(www_root, rel), mustWork = FALSE)
-  # Path traversal guard: resolved file must stay inside www_root.
-  if (!startsWith(file, normalizePath(www_root)) || !file.exists(file)) {
+  # Path traversal guard: resolved file must stay inside www_root, with a
+  # separator boundary so a sibling "www2/" never counts (DS-908 #27).
+  if (!.align_path_within(file, normalizePath(www_root)) || !file.exists(file)) {
     return(list(status = 404L, headers = list("Cache-Control" = "no-store"), body = "Not found"))
   }
   ext <- tolower(tools::file_ext(file))
@@ -252,19 +253,21 @@
         # Tier A "Open in Align web" (ALI-273): the Viewer pane can't reliably
         # open the system browser itself, so the host asks the R side to.
         # http(s) only — this must never become a general command runner.
+        # DS-908 hardening H40: only pages on the Align server this plugin
+        # is configured for (align_server_config()), which is all the pane
+        # ever opens (`<server>/editor?doc=...`).
         b <- .align_read_body(req)
         url <- as.character(b$url)
-        if (length(url) != 1 || !grepl("^https?://", url)) {
-          return(.align_json(list(error = "Only http(s) URLs can be opened."), status = 400L))
+        if (!.align_open_web_allowed(url, align_server_config()$serverUrl)) {
+          return(.align_json(list(error = "Only Align pages can be opened."), status = 400L))
         }
         utils::browseURL(url)
         return(.align_json(list(ok = TRUE)))
       }
-      if (method == "POST" && path == "/file/describe-rds") {
-        # DS-397: RDS preview for the Data tab. See describe.R.
-        b <- .align_read_body(req)
-        return(.align_json(align_describe_rds_bytes(b$contentBase64, b$script)))
-      }
+      # DS-908 (audit lead N19): there is no /file/describe-rds any more. It
+      # ran readRDS() on document-supplied bytes, with a script the caller
+      # sent, in the person's own R session; the Data tab's .rds preview now
+      # runs in Align's sandboxed R (packages/rstudio-host/src/rds-preview.ts).
       if (method == "POST" && path == "/handoff/capture") {
         # DS-396: the slice of the live session one figure's code depends
         # on, for the host to attach before the handoff save. See handoff.R.
@@ -274,6 +277,11 @@
       if (method == "POST" && path == "/install") {
         b <- .align_read_body(req)
         pkg <- as.character(b$name)
+        # DS-908 hardening H41: a CRAN-style package name and nothing else,
+        # so install.packages never sees a path, URL or vector of names.
+        if (!.align_valid_package_name(pkg)) {
+          return(.align_json(list(error = "That isn't a valid R package name."), status = 400L))
+        }
         if (!align_package_installed(pkg)) {
           utils::install.packages(pkg)
         }
@@ -284,6 +292,33 @@
       .align_json(list(error = conditionMessage(e)), status = 500L)
     })
   })
+}
+
+#' Whether POST /open-web may open `url` (DS-908 hardening H40): a single
+#' http(s) URL whose origin (scheme, host and port, compared exactly, so no
+#' userinfo or lookalike host gets through) is the configured Align server's,
+#' with no whitespace or control characters. The route exists only for "Open
+#' in Align web"; before this it opened any http(s) URL a caller sent, which
+#' made the R session a launcher for arbitrary pages.
+.align_open_web_allowed <- function(url, server_url) {
+  if (!is.character(url) || length(url) != 1 || is.na(url)) return(FALSE)
+  if (grepl("[[:space:][:cntrl:]]", url)) return(FALSE)
+  origin_of <- function(u) {
+    m <- regmatches(u, regexec("^(https?)://([^/?#]+)([/?#].*)?$", u))[[1]]
+    if (length(m) == 0) return(NA_character_)
+    tolower(paste0(m[2], "://", m[3]))
+  }
+  want <- origin_of(sub("/+$", "", server_url))
+  got <- origin_of(url)
+  !is.na(want) && !is.na(got) && identical(got, want)
+}
+
+#' Whether `name` is a valid R package name (DS-908 hardening H41): letters,
+#' digits and dots, starting with a letter, not ending with a dot, at least two
+#' characters. POST /install hands it straight to install.packages().
+.align_valid_package_name <- function(name) {
+  is.character(name) && length(name) == 1 && !is.na(name) &&
+    grepl("^[A-Za-z][A-Za-z0-9.]*[A-Za-z0-9]$", name)
 }
 
 #' Start the Align server. Returns the URL to open, which carries this launch's

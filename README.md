@@ -8,10 +8,20 @@ with one click.
 
 ## Install
 
+Install a tagged release (the newest tag is at the top of
+[Releases](https://github.com/derrickstaten/alignr/releases); tags are
+`v<date>`, for example `v2026.11.24`):
+
 ```r
 install.packages("remotes")
-remotes::install_github("derrickstaten/alignr")
+remotes::install_github("derrickstaten/alignr@v2026.11.24")   # use the newest tag
 ```
+
+Why a tag: it names one fixed, published release, so you get exactly the
+version you chose (and the same one again on a reinstall), and you update
+when you decide to rather than with whatever was pushed last.
+`remotes::install_github("derrickstaten/alignr")` without a tag installs the
+newest commit instead.
 
 Dependencies install automatically. If R asks *"Do you want to install from
 sources the packages which need compilation?"*, answer **no** — the prebuilt

@@ -19,7 +19,6 @@ source("R/version_check.R")
 source("R/server.R")
 source("R/oauth.R")
 source("R/handoff.R")
-source("R/describe.R")
 source("R/store.R")
 source("R/storage_proxy.R")
 
@@ -186,14 +185,31 @@ re <- post_json("/render", list(code = 'stop("http boom")'))
 check("POST /render returns error as JSON data", identical(re$error, "http boom"))
 hc <- post_json("/handoff/capture", list(code = 'p <- ggplot(t1_session_df, aes(a, a)) + geom_point()'))
 check("POST /handoff/capture returns the session slice as JSON", isTRUE(hc$found) && "t1_session_df" %in% unlist(hc$objects) && nzchar(hc$contentBase64))
-# DS-397: the describe snippet itself is @align/core's and is tested there
-# against real R; here the plumbing — bytes in, the host's script run, JSON out.
-dr <- post_json("/file/describe-rds", list(
-  contentBase64 = hc$contentBase64,
-  script = '.align_describe_rds <- function(path) { x <- readRDS(path); paste0("{\\"kind\\":\\"probe\\",\\"n\\":", length(x$objects), "}") }'
-))
-check("POST /file/describe-rds runs the supplied script against the bytes", identical(jsonlite::fromJSON(dr$json)$n, 1L))
-check("POST /file/describe-rds refuses an empty payload", nzchar(post_json("/file/describe-rds", list(contentBase64 = "", script = "x"))$error))
+# DS-908 hardening H40/H41: /open-web opens only the configured Align
+# server's pages, and /install takes only a package name. Only refusals are
+# exercised over HTTP: an accepted /open-web would open a real browser.
+ow <- post_json("/open-web", list(url = "https://evil.example/phish"))
+check("POST /open-web refuses another site (H40)", identical(ow$error, "Only Align pages can be opened."))
+ip <- post_json("/install", list(name = "https://evil.example/pkg.tar.gz"))
+check("POST /install refuses a URL as a package name (H41)", identical(ip$error, "That isn't a valid R package name."))
+# DS-908 (audit lead N19): the R session never reads document-supplied .rds
+# bytes for a preview, and never runs a describe script a caller sends — the
+# Data tab previews in Align's sandboxed R instead. The old route is gone.
+rds_marker <- file.path(tempdir(), "n19_describe_marker.txt")
+unlink(rds_marker)
+dr_raw <- tryCatch({
+  payload <- tempfile()
+  writeLines(as.character(jsonlite::toJSON(list(
+    contentBase64 = hc$contentBase64,
+    script = sprintf('.align_describe_rds <- function(path) { writeLines("x", %s); x <- readRDS(path); "{}" }', deparse(rds_marker))
+  ), auto_unbox = TRUE)), payload)
+  http_raw(paste(
+    "-X POST -H 'Content-Type: application/json' -H", shQuote(paste0("X-Align-Nonce: ", nonce)), "--data-binary", paste0("@", shQuote(payload)),
+    shQuote(paste0(sub("/$", "", url), "/file/describe-rds"))
+  ))
+}, error = function(e) "")
+check("POST /file/describe-rds no longer exists: no script runs, no readRDS in the session", !file.exists(rds_marker) && !grepl('"json"', paste(dr_raw, collapse = ""), fixed = TRUE))
+check("align_describe_rds_bytes is gone from the package", !exists("align_describe_rds_bytes"))
 
 # ── Document persistence over HTTP ───────────────────────────────────────────
 docdir <- file.path(tempdir(), "align-docs")
@@ -245,6 +261,43 @@ stat_traversal <- jsonlite::fromJSON(http_get(paste0("/file/stat?path=", utils::
 check("stat path traversal reports exists=FALSE, not an escape", isFALSE(stat_traversal$exists))
 read_traversal <- jsonlite::fromJSON(http_get(paste0("/file/read?path=", utils::URLencode("../evil.R", reserved = TRUE))))
 check("read path traversal rejected", identical(read_traversal$error, "File not found."))
+
+# DS-908 #27: a sibling whose name starts with the working directory's name
+# ("align-docs-secrets" next to "align-docs") used to pass the prefix check,
+# and the ".." test never fired. Both are closed, and only scripts are served.
+sibling <- paste0(docdir, "-secrets")
+dir.create(sibling, showWarnings = FALSE)
+writeLines("SIBLING_DUMMY=1", file.path(sibling, "key.R"))
+read_http <- function(p) jsonlite::fromJSON(http_get(paste0("/file/read?path=", utils::URLencode(p, reserved = TRUE))))
+stat_http <- function(p) jsonlite::fromJSON(http_get(paste0("/file/stat?path=", utils::URLencode(p, reserved = TRUE))))
+check("read of a name-prefix sibling via .. is refused (DS-908 #27)",
+      identical(read_http(paste0("../", basename(sibling), "/key.R"))$error, "File not found."))
+check("stat of a name-prefix sibling via .. reports exists=FALSE (DS-908 #27)",
+      isFALSE(stat_http(paste0("../", basename(sibling), "/key.R"))$exists))
+check("a .. segment is refused even when it would land back inside",
+      is.null(.align_safe_rel_path("R/../R/plots.R")) && is.null(.align_safe_rel_path("R\\..\\R\\plots.R")))
+writeLines("p <- 1", file.path(docdir, "R", "fig..v2.R"))
+check("a '..' inside a file name is not a traversal",
+      identical(read_http("R/fig..v2.R")$content, "p <- 1"))
+check("the working directory itself is not a file inside it", is.null(.align_safe_rel_path(".")))
+writeLines("SECRET=1", file.path(docdir, ".Renviron"))
+writeLines("a,b", file.path(docdir, "data.csv"))
+check("read refuses a non-script inside the working directory (DS-908 #27)",
+      identical(read_http(".Renviron")$error, "File not found.") && identical(read_http("data.csv")$error, "File not found."))
+check("stat refuses a non-script too", isFALSE(stat_http(".Renviron")$exists))
+for (p in c("a.R", "a.r", "a.Rmd", "a.qmd", "a.py")) writeLines("x <- 1", file.path(docdir, p))
+check("every script extension the pane links to is still served",
+      all(vapply(c("a.R", "a.r", "a.Rmd", "a.qmd", "a.py"), function(p) identical(read_http(p)$content, "x <- 1"), logical(1))))
+check("path_within needs a separator boundary",
+      isTRUE(.align_path_within("/x/proj/a.R", "/x/proj")) && isFALSE(.align_path_within("/x/proj-secrets/a.R", "/x/proj")) &&
+      isFALSE(.align_path_within("/x/proj", "/x/proj")) && isTRUE(.align_path_within("/a.R", "/")))
+check(".align_rel_from_abs rejects a name-prefix sibling (DS-908 #27)",
+      is.null(.align_rel_from_abs(file.path(sibling, "key.R"))))
+www <- file.path(tempdir(), "www-t27"); dir.create(www, showWarnings = FALSE)
+dir.create(paste0(www, "2"), showWarnings = FALSE); writeLines("x", file.path(paste0(www, "2"), "x.js"))
+check("static files refuse a name-prefix sibling of www (DS-908 #27)",
+      identical(.align_static(www, paste0("/../", basename(www), "2/x.js"))$status, 404L))
+unlink(c(sibling, paste0(www, "2"), www, file.path(docdir, c(".Renviron", "data.csv", "a.R", "a.r", "a.Rmd", "a.qmd", "a.py")), file.path(docdir, "R", "fig..v2.R")), recursive = TRUE)
 
 # ── Live-buffer read (ALI-198 T1, revised: never save on the user's behalf) ──
 check("align_active_document_state degrades without rstudioapi",
@@ -513,12 +566,26 @@ check("status reports the flow as pending", isTRUE(align_oauth_status()$pending)
 # The callback handler, driven directly — httpuv would deliver exactly this.
 callback_app <- .align_callback_app(.align_oauth$pending$state)
 fake_req <- function(qs) list(PATH_INFO = "/callback", QUERY_STRING = qs)
+result_before <- .align_oauth$result
 res <- callback_app$call(fake_req("state=wrong&code=align_ac_x"))
 check("a mismatched state is refused (CSRF)",
-      res$status == 400L && grepl("state did not match", .align_oauth$result$error))
+      res$status == 400L && grepl("state did not match", res$body))
+check("a mismatched state leaves the pending sign-in's result alone (DS-908 #26)",
+      identical(.align_oauth$result, result_before) && !is.null(.align_oauth$pending))
+# DS-908 #26: the error branch used to run before the state check and paste
+# error_description into the page as HTML.
+res <- callback_app$call(fake_req("state=wrong&error=x&error_description=%3Cimg%20src%3Dx%20onerror%3Dalert(1)%3E"))
+check("a foreign error callback reflects nothing and records nothing (DS-908 #26)",
+      res$status == 400L && !grepl("<img", res$body, fixed = TRUE) && !grepl("onerror", res$body, fixed = TRUE) &&
+      identical(.align_oauth$result, result_before))
+res <- callback_app$call(fake_req(paste0("state=", .align_oauth$pending$state, "&error=x&error_description=%3Cimg%20src%3Dx%20onerror%3Dalert(1)%3E")))
+check("an error with the right state is HTML-escaped on the page (DS-908 #26)",
+      !grepl("<img", res$body, fixed = TRUE) && grepl("&lt;img src=x onerror=alert(1)&gt;", res$body, fixed = TRUE))
+check("html escape covers all five characters",
+      identical(.align_html_escape("<a href=\"x\">'&'</a>"), "&lt;a href=&quot;x&quot;&gt;&#39;&amp;&#39;&lt;/a&gt;"))
 res <- callback_app$call(fake_req(paste0("state=", .align_oauth$pending$state, "&error=access_denied&error_description=User%20said%20no")))
 check("a user-cancelled sign-in surfaces the server's reason",
-      identical(.align_oauth$result$error, "User said no"))
+      identical(.align_oauth$result$error, "User said no") && grepl("User said no", res$body, fixed = TRUE))
 # A real code against a server that isn't there: the exchange must come back
 # as data, since this handler runs inside httpuv where a throw is a 500.
 res <- callback_app$call(fake_req(paste0("state=", .align_oauth$pending$state, "&code=align_ac_x")))
@@ -541,7 +608,7 @@ writeLines('{"builtAt":"2026-09-02T00:00:00.000Z","commit":"abcdef0123456789","v
 st <- .align_read_build_stamp(stamp_dir)
 check("stamp reads version and commit", identical(st$version, "2026.9.2") && identical(st$commit, "abcdef0123456789"))
 check("missing stamp reads as NULL", is.null(.align_read_build_stamp(tempfile("nowhere"))))
-check("mismatch message names the install line", grepl('install_github("derrickstaten/alignr")', .align_release_mismatch_message("2026.9.2", "https://alignfigures.com"), fixed = TRUE))
+check("mismatch message names the tagged install line (DS-908 D11)", grepl('install_github("derrickstaten/alignr@v', .align_release_mismatch_message("2026.9.2", "https://alignfigures.com"), fixed = TRUE))
 Sys.setenv(ALIGNR_SERVER = "https://example.invalid/")
 check("ALIGNR_SERVER overrides and is trimmed", identical(.align_release_server(), "https://example.invalid"))
 check("unreachable server is a silent NULL", is.null(.align_fetch_deployed_commit("https://example.invalid")))
@@ -651,6 +718,35 @@ check("proxy: a request without the method header is refused",
       identical(.align_storage_proxy(list(QUERY_STRING = paste0("u=", utils::URLencode(paste0("https://a.r2.cloudflarestorage.com/k", sig), reserved = TRUE))))$status, 400L))
 check("proxy: a disallowed URL is refused before any network call",
       identical(.align_storage_proxy(list(HTTP_X_ALIGN_STORAGE_METHOD = "GET", QUERY_STRING = paste0("u=", utils::URLencode("https://evil.example.com/k?X-Amz-Signature=x", reserved = TRUE))))$status, 403L))
+
+# DS-908 hardening H40: the /open-web origin rule.
+srv <- "https://alignfigures.com"
+check("open-web: the server's editor page is allowed",
+      .align_open_web_allowed("https://alignfigures.com/editor?doc=abc", srv) &&
+      .align_open_web_allowed("https://AlignFigures.com/", srv) &&
+      .align_open_web_allowed("https://alignfigures.com", paste0(srv, "/")))
+check("open-web: other origins, userinfo, lookalikes and other schemes are refused",
+      !.align_open_web_allowed("https://evil.example/", srv) &&
+      !.align_open_web_allowed(paste0("https://alignfigures.com", "@", "evil.example/"), srv) &&
+      !.align_open_web_allowed("https://alignfigures.com.evil.example/", srv) &&
+      !.align_open_web_allowed("http://alignfigures.com/editor", srv) &&
+      !.align_open_web_allowed("https://alignfigures.com:444/", srv) &&
+      !.align_open_web_allowed("file:///etc/passwd", srv) &&
+      !.align_open_web_allowed("javascript:alert(1)", srv))
+check("open-web: whitespace, control characters and non-scalars are refused",
+      !.align_open_web_allowed("https://alignfigures.com/ x", srv) &&
+      !.align_open_web_allowed("https://alignfigures.com/\nx", srv) &&
+      !.align_open_web_allowed(c("https://alignfigures.com/", "https://alignfigures.com/"), srv) &&
+      !.align_open_web_allowed(character(0), srv) && !.align_open_web_allowed(NA_character_, srv))
+check("open-web: a local dev server override is its own origin",
+      .align_open_web_allowed("http://localhost:3000/editor?doc=x", "http://localhost:3000") &&
+      !.align_open_web_allowed("http://localhost:3001/editor", "http://localhost:3000"))
+# DS-908 hardening H41: package names.
+check("install: valid package names pass",
+      all(vapply(c("ggplot2", "data.table", "R6", "BiocManager"), .align_valid_package_name, logical(1))))
+check("install: paths, URLs, vectors and odd names are refused",
+      !any(vapply(c("../x", "/tmp/pkg.tar.gz", "https://evil.example/p.tar.gz", "pkg.", "1pkg", "a", "a b", "a;b", ""), .align_valid_package_name, logical(1))) &&
+      !.align_valid_package_name(c("ggplot2", "dplyr")) && !.align_valid_package_name(NA_character_))
 
 cat(sprintf("\n%d passed, %d failed\n", passed, failed))
 if (failed > 0) quit(status = 1)

@@ -20,11 +20,13 @@
 #' Absolute path -> path relative to getwd(), or NULL if outside it. Inverse
 #' of tracked_files.R's .align_safe_rel_path (that resolves relative -> safe
 #' absolute; this resolves rstudioapi's absolute editor path -> the relative
-#' form a Visualization's fileSource stores).
+#' form a Visualization's fileSource stores). Containment needs a separator
+#' boundary, so a script in a sibling such as "proj-old/" is outside "proj/"
+#' rather than becoming "-old/..." (DS-908 #27).
 .align_rel_from_abs <- function(abs_path) {
   root <- normalizePath(getwd())
   full <- suppressWarnings(normalizePath(abs_path, mustWork = FALSE))
-  if (!startsWith(full, root)) return(NULL)
+  if (!.align_path_within(full, root)) return(NULL)
   rel <- substring(full, nchar(root) + 1)
   rel <- sub("^[/\\\\]+", "", rel)
   if (!nzchar(rel)) return(NULL)

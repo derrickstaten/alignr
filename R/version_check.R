@@ -55,10 +55,14 @@
 }
 
 #' The message for a mismatch, kept pure so the test harness can pin it.
+#' It points at a tagged release (DS-908 D11): a tag is one fixed, published
+#' release, so the person updates to a version they chose, not the newest commit.
 .align_release_mismatch_message <- function(version, server) {
   paste0(
     "Align plugin ", version, " was built for a different Align Web release than ",
-    server, " is running. Update with remotes::install_github(\"derrickstaten/alignr\")."
+    server, " is running. Update to the newest tagged release with ",
+    "remotes::install_github(\"derrickstaten/alignr@v<tag>\") ",
+    "(tags: https://github.com/derrickstaten/alignr/releases)."
   )
 }
 

@@ -10,20 +10,68 @@
 # is one cheap mtime check per tracked file; content is only fetched, and the
 # file only re-scanned for marker regions, when mtime actually moved.
 
+#' Is `full` inside the directory `root`? Both must already be normalized
+#' (normalizePath); either separator is accepted. A bare string prefix is not
+#' enough: "/x/proj-secrets" starts with "/x/proj" but is a sibling, so the
+#' match must end at a path separator (DS-908 #27). The directory itself does
+#' not count as inside it. Case-folded on Windows, whose paths are
+#' case-insensitive.
+.align_path_within <- function(full, root) {
+  full <- gsub("\\", "/", full, fixed = TRUE)
+  root <- gsub("\\", "/", root, fixed = TRUE)
+  if (.Platform$OS.type == "windows") {
+    full <- tolower(full)
+    root <- tolower(root)
+  }
+  prefix <- if (endsWith(root, "/")) root else paste0(root, "/")
+  startsWith(full, prefix) && nchar(full) > nchar(prefix)
+}
+
+#' Relative path from the pane -> safe absolute path inside getwd(), or NULL.
+#'
+#' The path is document state (a figure's fileSource) that any editor of a
+#' shared document can set, so it is treated as hostile (DS-908 #27): no
+#' absolute paths, no ".." segment anywhere (rejected as a segment, so a name
+#' like "fig..v2.R" is still fine), and the resolved path — symlinks
+#' followed, since normalizePath resolves those for files that exist — must
+#' sit inside the working directory with a separator boundary. Before
+#' DS-908 the ".." test used a regex with fixed = TRUE (never matched) and
+#' the containment test was a bare prefix, so "../proj-secrets/key.txt"
+#' escaped from proj/.
 .align_safe_rel_path <- function(path) {
   path <- as.character(path)
   if (length(path) != 1 || is.na(path) || !nzchar(path)) return(NULL)
   if (grepl("^[/\\\\]", path) || grepl("^[A-Za-z]:", path)) return(NULL)  # absolute path (posix or windows)
-  if (grepl("\\.\\.", path, fixed = TRUE)) return(NULL)
-  root <- normalizePath(getwd())
-  full <- suppressWarnings(normalizePath(file.path(root, path), mustWork = FALSE))
-  if (!startsWith(full, root)) return(NULL)
+  if (any(strsplit(path, "[/\\\\]")[[1]] == "..")) return(NULL)
+  root <- normalizePath(getwd(), winslash = "/")
+  full <- suppressWarnings(normalizePath(file.path(root, path), winslash = "/", mustWork = FALSE))
+  if (!.align_path_within(full, root)) return(NULL)
+  full
+}
+
+#' Does the path name a script a figure can be linked to? The pane only ever
+#' asks /file/stat and /file/read about this machine's own links to scripts
+#' (packages/rstudio-host/src/link-trust.ts gates every caller on
+#' isRScriptPath, and data files never travel this way), so the server
+#' refuses everything else too: even a path that passes the containment
+#' check cannot name `.Renviron` or a credentials file in the project
+#' (DS-908 #27). Keep the pattern in step with isRScriptPath in
+#' packages/core/src/plugin-chrome/native-trust.ts.
+.align_is_script_path <- function(path) {
+  grepl("\\.(r|rmd|qmd|py)$", path, ignore.case = TRUE)
+}
+
+#' Resolve a pane-supplied path for the tracked-file endpoints: inside the
+#' working directory and a script, or NULL (DS-908 #27).
+.align_tracked_script_path <- function(path) {
+  full <- .align_safe_rel_path(path)
+  if (is.null(full) || !.align_is_script_path(full)) return(NULL)
   full
 }
 
 #' mtime/size for a tracked file — the poll's cheap "did anything change" check.
 align_stat_file <- function(path) {
-  full <- .align_safe_rel_path(path)
+  full <- .align_tracked_script_path(path)
   if (is.null(full) || !file.exists(full)) {
     return(list(path = path, exists = FALSE))
   }
@@ -42,7 +90,7 @@ align_stat_file <- function(path) {
 #' never used to justify writing anything back (see align_active_document_state
 #' for the live, unsaved-included alternative used whenever it applies).
 align_read_file <- function(path) {
-  full <- .align_safe_rel_path(path)
+  full <- .align_tracked_script_path(path)
   if (is.null(full) || !file.exists(full)) {
     return(list(error = "File not found."))
   }
